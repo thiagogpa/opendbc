@@ -4,8 +4,7 @@ Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
 This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 """
-import pytest
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock
 
 from opendbc.sunnypilot.car.subaru.brake_hold import BrakeHoldController, BrakeHoldCarController, _State
 from opendbc.sunnypilot.car.subaru.values_ext import SubaruFlagsSP
@@ -234,7 +233,7 @@ def _make_cs(standstill=True, brake_pressed=True, gas_pressed=False, v_ego=0.0, 
   cs.out.brakePressed = brake_pressed
   cs.out.gasPressed = gas_pressed
   cs.out.vEgoRaw = v_ego
-  cs.brake_pedal_msg = {} if empty_msg else dict(_BRAKE_PEDAL_MSG_TEMPLATE, **{"Brake_Pedal": pedal_raw})
+  cs.brake_pedal_msg = {} if empty_msg else {**_BRAKE_PEDAL_MSG_TEMPLATE, "Brake_Pedal": pedal_raw}
   return cs
 
 
