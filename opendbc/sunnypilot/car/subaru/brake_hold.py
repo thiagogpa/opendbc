@@ -7,7 +7,11 @@ See the LICENSE.md file in the root directory for more details.
 from enum import IntEnum
 
 from opendbc.car import structs
+from opendbc.sunnypilot.car.subaru import subarucan_ext
 from opendbc.sunnypilot.car.subaru.values_ext import SubaruFlagsSP
+
+# Brake_Pedal (0x139) runs at 50 Hz — send every 2 control frames (100 Hz loop)
+_BRAKE_HOLD_FRAME_DIVISOR = 2
 
 
 class _State(IntEnum):
@@ -44,6 +48,10 @@ class BrakeHoldController:
   def should_hold(self) -> bool:
     return self._state == _State.HOLDING
 
+  @property
+  def last_pedal_raw(self) -> int:
+    return self._last_pedal_raw
+
   def update(self, mads_active: bool, standstill: bool, brake_pressed: bool,
              gas_pressed: bool, v_ego: float, brake_pedal_raw: int) -> bool:
     """Update state machine. Returns should_hold."""
@@ -76,6 +84,7 @@ class BrakeHoldCarController:
   """Mixin for CarController — manages BrakeHoldController and produces cam-bus CAN sends."""
 
   def __init__(self, CP: structs.CarParams, CP_SP: structs.CarParamsSP) -> None:
+    self._CP = CP
     self._enabled = bool(CP_SP.flags & SubaruFlagsSP.BRAKE_HOLD)
     self._controller = BrakeHoldController()
 
@@ -84,14 +93,14 @@ class BrakeHoldCarController:
     return self._enabled and self._controller.should_hold
 
   def create_brake_hold(self, packer, frame: int, CC, CC_SP, CS) -> list:
-    """
-    Call once per CarController.update() frame.
-    Returns list of CAN messages to append to can_sends (may be empty).
-    Phase 3 will fill in the actual CAN packing once the wire-level mechanism
-    is confirmed on hardware. For now returns empty list (stub).
-    """
+    """Call once per CarController.update() frame. Returns CAN messages (may be empty)."""
     if not self._enabled:
       return []
+
+    # CS.brake_pedal_msg is a dict populated by SnGCarState from the pt-bus Brake_Pedal frame.
+    # Fall back to empty dict at startup (before first CAN frame arrives).
+    brake_pedal_msg: dict = getattr(CS, 'brake_pedal_msg', {})
+    brake_pedal_raw = int(brake_pedal_msg.get("Brake_Pedal", 0))
 
     self._controller.update(
       mads_active=CC_SP.mads.active,
@@ -99,8 +108,20 @@ class BrakeHoldCarController:
       brake_pressed=CS.out.brakePressed,
       gas_pressed=CS.out.gasPressed,
       v_ego=CS.out.vEgoRaw,
-      brake_pedal_raw=getattr(CS, 'brake_pedal_raw', 0),
+      brake_pedal_raw=brake_pedal_raw,
     )
 
-    # CAN packing stub — filled in Phase 3 after hardware confirmation
-    return []
+    if not self.is_holding:
+      return []
+
+    # No template yet — brake_pedal_msg empty at startup, skip until populated
+    if not brake_pedal_msg:
+      return []
+
+    # Send at 50 Hz (every 2 frames of the 100 Hz control loop)
+    if frame % _BRAKE_HOLD_FRAME_DIVISOR != 0:
+      return []
+
+    return [subarucan_ext.create_brake_hold_pedal(
+      packer, brake_pedal_msg, self._controller.last_pedal_raw
+    )]

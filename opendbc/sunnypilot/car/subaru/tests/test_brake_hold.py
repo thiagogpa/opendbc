@@ -5,8 +5,10 @@ This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 """
 import pytest
+from unittest.mock import MagicMock, call
 
-from opendbc.sunnypilot.car.subaru.brake_hold import BrakeHoldController, _State
+from opendbc.sunnypilot.car.subaru.brake_hold import BrakeHoldController, BrakeHoldCarController, _State
+from opendbc.sunnypilot.car.subaru.values_ext import SubaruFlagsSP
 
 
 def _ctrl(**overrides):
@@ -192,3 +194,158 @@ class TestBrakeHoldControllerProperties:
     result = ctrl.update(**_ctrl(mads_active=True, standstill=True, brake_pressed=True,
                                  brake_pedal_raw=96, v_ego=0.0))
     assert result is ctrl.should_hold
+
+  def test_last_pedal_raw_property(self):
+    ctrl = BrakeHoldController()
+    assert ctrl.last_pedal_raw == 0
+    ctrl.update(**_ctrl(mads_active=True, standstill=True, brake_pressed=True,
+                        brake_pedal_raw=80, v_ego=0.0))
+    assert ctrl.last_pedal_raw == 80
+
+
+# ---------------------------------------------------------------------------
+# BrakeHoldCarController — Phase 3 CAN packing tests
+# ---------------------------------------------------------------------------
+
+_BRAKE_PEDAL_MSG_TEMPLATE = {
+  "CHECKSUM": 0, "Signal1": 0, "Speed": 12, "Signal2": 0,
+  "Brake_Lights": 0, "Signal3": 0, "Brake_Pedal": 96, "Signal4": 0, "COUNTER": 5,
+}
+_CAM_BUS = 2  # CanBus.camera
+
+
+def _make_mixin(has_brake_hold=True):
+  CP = MagicMock()
+  CP.flags = 0
+  CP_SP = MagicMock()
+  CP_SP.flags = SubaruFlagsSP.BRAKE_HOLD if has_brake_hold else 0
+  return BrakeHoldCarController(CP, CP_SP)
+
+
+def _make_cc_sp(mads_active=True):
+  cc_sp = MagicMock()
+  cc_sp.mads.active = mads_active
+  return cc_sp
+
+
+def _make_cs(standstill=True, brake_pressed=True, gas_pressed=False, v_ego=0.0, pedal_raw=96, empty_msg=False):
+  cs = MagicMock()
+  cs.out.standstill = standstill
+  cs.out.brakePressed = brake_pressed
+  cs.out.gasPressed = gas_pressed
+  cs.out.vEgoRaw = v_ego
+  cs.brake_pedal_msg = {} if empty_msg else dict(_BRAKE_PEDAL_MSG_TEMPLATE, **{"Brake_Pedal": pedal_raw})
+  return cs
+
+
+def _make_packer():
+  packer = MagicMock()
+  packer.make_can_msg.return_value = (0x139, b'\x00' * 8, _CAM_BUS)
+  return packer
+
+
+def _reach_holding(mixin, packer):
+  """Drive mixin into HOLDING via standstill + brake."""
+  cs = _make_cs(standstill=True, brake_pressed=True, pedal_raw=96)
+  mixin.create_brake_hold(packer, 0, MagicMock(), _make_cc_sp(mads_active=True), cs)
+  assert mixin.is_holding
+
+
+class TestBrakeHoldCarControllerCAN:
+  def test_no_output_when_flag_disabled(self):
+    mixin = _make_mixin(has_brake_hold=False)
+    result = mixin.create_brake_hold(_make_packer(), 0, MagicMock(), _make_cc_sp(), _make_cs())
+    assert result == []
+
+  def test_no_output_while_idle(self):
+    mixin = _make_mixin()
+    packer = _make_packer()
+    # MADS off → stays IDLE
+    result = mixin.create_brake_hold(packer, 0, MagicMock(), _make_cc_sp(mads_active=False), _make_cs())
+    assert result == []
+    packer.make_can_msg.assert_not_called()
+
+  def test_no_output_on_odd_frames(self):
+    """Brake_Pedal sends at 50 Hz — skip odd frames (frame % 2 != 0)."""
+    mixin = _make_mixin()
+    packer = _make_packer()
+    _reach_holding(mixin, packer)
+    packer.reset_mock()
+    result = mixin.create_brake_hold(packer, 1, MagicMock(), _make_cc_sp(), _make_cs(brake_pressed=False))
+    assert result == []
+    packer.make_can_msg.assert_not_called()
+
+  def test_output_on_even_frames_when_holding(self):
+    """Holding + even frame → one Brake_Pedal message."""
+    mixin = _make_mixin()
+    packer = _make_packer()
+    _reach_holding(mixin, packer)
+    packer.reset_mock()
+    result = mixin.create_brake_hold(packer, 2, MagicMock(), _make_cc_sp(), _make_cs(brake_pressed=False))
+    assert len(result) == 1
+    packer.make_can_msg.assert_called_once()
+
+  def test_can_msg_correct_name_and_bus(self):
+    """make_can_msg called with 'Brake_Pedal' on CanBus.camera (2)."""
+    mixin = _make_mixin()
+    packer = _make_packer()
+    _reach_holding(mixin, packer)
+    packer.reset_mock()
+    mixin.create_brake_hold(packer, 0, MagicMock(), _make_cc_sp(), _make_cs(brake_pressed=False))
+    name, bus, values = packer.make_can_msg.call_args[0]
+    assert name == "Brake_Pedal"
+    assert bus == _CAM_BUS
+
+  def test_can_msg_speed_zero(self):
+    """Injected Speed signal must be 0 (car at standstill)."""
+    mixin = _make_mixin()
+    packer = _make_packer()
+    _reach_holding(mixin, packer)
+    packer.reset_mock()
+    mixin.create_brake_hold(packer, 0, MagicMock(), _make_cc_sp(), _make_cs(brake_pressed=False))
+    _, _, values = packer.make_can_msg.call_args[0]
+    assert values["Speed"] == 0
+
+  def test_can_msg_brake_pedal_matches_last_pedal_raw(self):
+    """Brake_Pedal signal equals the driver's last recorded value."""
+    mixin = _make_mixin()
+    packer = _make_packer()
+    _reach_holding(mixin, packer)  # reaches holding with pedal_raw=96
+    packer.reset_mock()
+    mixin.create_brake_hold(packer, 0, MagicMock(), _make_cc_sp(), _make_cs(brake_pressed=False))
+    _, _, values = packer.make_can_msg.call_args[0]
+    assert values["Brake_Pedal"] == 96
+
+  def test_can_msg_brake_lights_on(self):
+    """Brake_Lights must be 1 while holding."""
+    mixin = _make_mixin()
+    packer = _make_packer()
+    _reach_holding(mixin, packer)
+    packer.reset_mock()
+    mixin.create_brake_hold(packer, 0, MagicMock(), _make_cc_sp(), _make_cs(brake_pressed=False))
+    _, _, values = packer.make_can_msg.call_args[0]
+    assert values["Brake_Lights"] == 1
+
+  def test_no_output_when_brake_pedal_msg_empty(self):
+    """No CAN send at startup before first Brake_Pedal frame arrives."""
+    mixin = _make_mixin()
+    packer = _make_packer()
+    # Force holding state via controller directly
+    mixin._controller._state = _State.HOLDING
+    mixin._controller._last_pedal_raw = 96
+    result = mixin.create_brake_hold(packer, 0, MagicMock(), _make_cc_sp(), _make_cs(empty_msg=True))
+    assert result == []
+
+  def test_stops_sending_after_gas(self):
+    """Gas press transitions to RELEASING — no more CAN messages."""
+    mixin = _make_mixin()
+    packer = _make_packer()
+    _reach_holding(mixin, packer)
+    packer.reset_mock()
+    # Gas press
+    mixin.create_brake_hold(packer, 0, MagicMock(), _make_cc_sp(),
+                            _make_cs(standstill=True, brake_pressed=False, gas_pressed=True, v_ego=0.0))
+    assert not mixin.is_holding
+    result = mixin.create_brake_hold(packer, 2, MagicMock(), _make_cc_sp(),
+                                     _make_cs(standstill=False, gas_pressed=False, v_ego=1.0))
+    assert result == []

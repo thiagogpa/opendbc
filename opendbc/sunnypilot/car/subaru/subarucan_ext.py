@@ -66,3 +66,30 @@ def create_brake_pedal(packer, CP, brake_pedal_msg, send_resume):
     values["Speed"] = 1 if CP.flags & SubaruFlags.PREGLOBAL else 3
 
   return packer.make_can_msg("Brake_Pedal", CanBus.camera, values)
+
+
+def create_brake_hold_pedal(packer, brake_pedal_msg: dict, pedal_raw: int):
+  """Inject Brake_Pedal on cam bus to hold car at standstill.
+
+  Mirrors the last received Brake_Pedal frame, then forces:
+    Speed=0      — tells PCM car is stopped
+    Brake_Pedal  — driver's last recorded pressure value
+    Brake_Lights — on
+
+  Only valid for Global Gen1 non-hybrid (PREGLOBAL excluded from brake hold).
+  """
+  values = {s: brake_pedal_msg[s] for s in [
+    "CHECKSUM",
+    "Signal1",
+    "Speed",
+    "Signal2",
+    "Brake_Lights",
+    "Signal3",
+    "Brake_Pedal",
+    "Signal4",
+  ]}
+  values["COUNTER"] = create_counter(brake_pedal_msg)
+  values["Speed"] = 0
+  values["Brake_Pedal"] = pedal_raw
+  values["Brake_Lights"] = 1
+  return packer.make_can_msg("Brake_Pedal", CanBus.camera, values)
