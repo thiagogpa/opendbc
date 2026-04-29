@@ -141,7 +141,10 @@ class CarController(CarControllerBase, SnGCarController, BrakeHoldCarController)
         if self.frame % 2 == 0:
           can_sends.append(subarucan.create_es_static_2(self.packer))
 
-    can_sends.extend(SnGCarController.create_stop_and_go(self, self.packer, CC, CS, self.frame))
+    sng_sends = SnGCarController.create_stop_and_go(self, self.packer, CC, CS, self.frame)
+    if self.is_holding:
+      sng_sends = [m for m in sng_sends if m[0] != 0x139]
+    can_sends.extend(sng_sends)
     can_sends.extend(BrakeHoldCarController.create_brake_hold(self, self.packer, self.frame, CC, CC_SP, CS))
 
     new_actuators = actuators.as_builder()
