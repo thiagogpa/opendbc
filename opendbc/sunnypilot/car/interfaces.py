@@ -87,6 +87,7 @@ def setup_interfaces(CI, CP: structs.CarParams, CP_SP: structs.CarParamsSP,
   _initialize_coop_steering(CP, CP_SP, params_dict)
   _initialize_radar_tracks(CP, CP_SP, can_recv, can_send)
   _initialize_stop_and_go(CP, CP_SP, params_dict)
+  _initialize_brake_hold(CP, CP_SP)
   _initialize_toyota(CP, CP_SP, params_dict)
 
 
@@ -131,6 +132,15 @@ def _initialize_stop_and_go(CP: structs.CarParams, CP_SP: structs.CarParamsSP, p
       CP_SP.flags |= SubaruFlagsSP.STOP_AND_GO_MANUAL_PARKING_BRAKE.value
     if stop_and_go or stop_and_go_manual_parking_brake:
       CP_SP.safetyParam |= SubaruSafetyFlagsSP.STOP_AND_GO
+
+
+def _initialize_brake_hold(CP: structs.CarParams, CP_SP: structs.CarParamsSP) -> None:
+  # Always-on for Global Gen1 non-hybrid manual-handbrake Subarus (no EPB, no Gen2).
+  # These cars cannot hold themselves at a stop without software assistance.
+  if CP.brand == 'subaru' and not CP.flags & (SubaruFlags.GLOBAL_GEN2 | SubaruFlags.HYBRID | SubaruFlags.PREGLOBAL):
+    CP_SP.flags |= SubaruFlagsSP.BRAKE_HOLD.value
+    # Reuse the SnG safety param so Brake_Pedal on cam bus stays TX-allowed.
+    CP_SP.safetyParam |= SubaruSafetyFlagsSP.STOP_AND_GO
 
 
 def _initialize_toyota(CP: structs.CarParams, CP_SP: structs.CarParamsSP, params_dict: dict[str, str]) -> None:
