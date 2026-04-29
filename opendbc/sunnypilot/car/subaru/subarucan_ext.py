@@ -7,32 +7,38 @@ def create_counter(msg):
 
 def create_throttle(packer, CP, throttle_msg, send_resume):
   if CP.flags & SubaruFlags.PREGLOBAL:
-    values = {s: throttle_msg[s] for s in [
-      "Throttle_Pedal",
-      "Signal1",
-      "Not_Full_Throttle",
-      "Signal2",
-      "Engine_RPM",
-      "Off_Throttle",
-      "Signal3",
-      "Throttle_Cruise",
-      "Throttle_Combo",
-      "Throttle_Body",
-      "Off_Throttle_2",
-      "Signal4",
-    ]}
+    values = {
+      s: throttle_msg[s]
+      for s in [
+        "Throttle_Pedal",
+        "Signal1",
+        "Not_Full_Throttle",
+        "Signal2",
+        "Engine_RPM",
+        "Off_Throttle",
+        "Signal3",
+        "Throttle_Cruise",
+        "Throttle_Combo",
+        "Throttle_Body",
+        "Off_Throttle_2",
+        "Signal4",
+      ]
+    }
   else:
-    values = {s: throttle_msg[s] for s in [
-      "CHECKSUM",
-      "Signal1",
-      "Engine_RPM",
-      "Neutral",
-      "Throttle_Pedal",
-      "Throttle_Cruise",
-      "Throttle_Combo",
-      "Signal3",
-      "Off_Accel",
-    ]}
+    values = {
+      s: throttle_msg[s]
+      for s in [
+        "CHECKSUM",
+        "Signal1",
+        "Engine_RPM",
+        "Neutral",
+        "Throttle_Pedal",
+        "Throttle_Cruise",
+        "Throttle_Combo",
+        "Signal3",
+        "Off_Accel",
+      ]
+    }
 
   values["COUNTER"] = create_counter(throttle_msg)
 
@@ -44,22 +50,28 @@ def create_throttle(packer, CP, throttle_msg, send_resume):
 
 def create_brake_pedal(packer, CP, brake_pedal_msg, send_resume):
   if CP.flags & SubaruFlags.PREGLOBAL:
-    values = {s: brake_pedal_msg[s] for s in [
-      "Speed",
-      "Brake_Pedal",
-      "Signal1",
-    ]}
+    values = {
+      s: brake_pedal_msg[s]
+      for s in [
+        "Speed",
+        "Brake_Pedal",
+        "Signal1",
+      ]
+    }
   else:
-    values = {s: brake_pedal_msg[s] for s in [
-      "CHECKSUM",
-      "Signal1",
-      "Speed",
-      "Signal2",
-      "Brake_Lights",
-      "Signal3",
-      "Brake_Pedal",
-      "Signal4",
-    ]}
+    values = {
+      s: brake_pedal_msg[s]
+      for s in [
+        "CHECKSUM",
+        "Signal1",
+        "Speed",
+        "Signal2",
+        "Brake_Lights",
+        "Signal3",
+        "Brake_Pedal",
+        "Signal4",
+      ]
+    }
     values["COUNTER"] = create_counter(brake_pedal_msg)
 
   if send_resume:
@@ -78,16 +90,19 @@ def create_brake_hold_pedal(packer, brake_pedal_msg: dict, pedal_raw: int):
 
   Only valid for Global Gen1 non-hybrid (PREGLOBAL excluded from brake hold).
   """
-  values = {s: brake_pedal_msg[s] for s in [
-    "CHECKSUM",
-    "Signal1",
-    "Speed",
-    "Signal2",
-    "Brake_Lights",
-    "Signal3",
-    "Brake_Pedal",
-    "Signal4",
-  ]}
+  values = {
+    s: brake_pedal_msg[s]
+    for s in [
+      "CHECKSUM",
+      "Signal1",
+      "Speed",
+      "Signal2",
+      "Brake_Lights",
+      "Signal3",
+      "Brake_Pedal",
+      "Signal4",
+    ]
+  }
   values["COUNTER"] = create_counter(brake_pedal_msg)
   values["Speed"] = 0
   values["Brake_Pedal"] = pedal_raw

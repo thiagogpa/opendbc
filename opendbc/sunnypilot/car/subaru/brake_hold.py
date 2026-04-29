@@ -4,6 +4,7 @@ Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
 This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 """
+
 from enum import IntEnum
 
 from opendbc.car import structs
@@ -52,8 +53,7 @@ class BrakeHoldController:
   def last_pedal_raw(self) -> int:
     return self._last_pedal_raw
 
-  def update(self, mads_active: bool, standstill: bool, brake_pressed: bool,
-             gas_pressed: bool, v_ego: float, brake_pedal_raw: int) -> bool:
+  def update(self, mads_active: bool, standstill: bool, brake_pressed: bool, gas_pressed: bool, v_ego: float, brake_pedal_raw: int) -> bool:
     """Update state machine. Returns should_hold."""
 
     # Track the last pedal value while driver is braking at standstill
@@ -99,7 +99,7 @@ class BrakeHoldCarController:
 
     # CS.brake_pedal_msg is a dict populated by SnGCarState from the pt-bus Brake_Pedal frame.
     # Fall back to empty dict at startup (before first CAN frame arrives).
-    brake_pedal_msg: dict = getattr(CS, 'brake_pedal_msg', {})
+    brake_pedal_msg: dict = getattr(CS, "brake_pedal_msg", {})
     brake_pedal_raw = int(brake_pedal_msg.get("Brake_Pedal", 0))
 
     self._controller.update(
@@ -122,6 +122,4 @@ class BrakeHoldCarController:
     if frame % _BRAKE_HOLD_FRAME_DIVISOR != 0:
       return []
 
-    return [subarucan_ext.create_brake_hold_pedal(
-      packer, brake_pedal_msg, self._controller.last_pedal_raw
-    )]
+    return [subarucan_ext.create_brake_hold_pedal(packer, brake_pedal_msg, self._controller.last_pedal_raw)]
