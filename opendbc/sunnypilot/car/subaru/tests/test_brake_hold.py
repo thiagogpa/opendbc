@@ -283,14 +283,14 @@ class TestBrakeHoldCarControllerCAN:
     assert bus == _CAM_BUS
 
   def test_can_msg_speed_zero(self):
-    """Injected Speed signal must be 0 (car at standstill)."""
+    """Injected Speed signal must be 3 (MPB keepalive for ECU response)."""
     mixin = _make_mixin()
     packer = _make_packer()
     _reach_holding(mixin, packer)
     packer.reset_mock()
     mixin.create_brake_hold(packer, 0, MagicMock(), _make_cc_sp(), _make_cs(brake_pressed=False))
     _, _, values = packer.make_can_msg.call_args[0]
-    assert values["Speed"] == 0
+    assert values["Speed"] == 3
 
   def test_can_msg_brake_pedal_matches_last_pedal_raw(self):
     """Brake_Pedal signal equals the driver's last recorded value."""
