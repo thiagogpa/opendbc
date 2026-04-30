@@ -84,7 +84,7 @@ def create_brake_hold_pedal(packer, brake_pedal_msg: dict, pedal_raw: int):
   """Inject Brake_Pedal on cam bus to hold car at standstill.
 
   Mirrors the last received Brake_Pedal frame, then forces:
-    Speed=0      — tells PCM car is stopped
+    Speed=3      — keepalive signal (0.169 kph) to prevent PCM timeout
     Brake_Pedal  — driver's last recorded pressure value
     Brake_Lights — on
 
@@ -104,7 +104,7 @@ def create_brake_hold_pedal(packer, brake_pedal_msg: dict, pedal_raw: int):
     ]
   }
   values["COUNTER"] = create_counter(brake_pedal_msg)
-  values["Speed"] = 0
+  values["Speed"] = 3
   values["Brake_Pedal"] = pedal_raw
   values["Brake_Lights"] = 1
   return packer.make_can_msg("Brake_Pedal", CanBus.camera, values)
