@@ -10,6 +10,10 @@ from unittest.mock import MagicMock
 from opendbc.sunnypilot.car.subaru.brake_hold import BrakeHoldController, BrakeHoldCarController, _State
 from opendbc.sunnypilot.car.subaru.values_ext import SubaruFlagsSP
 
+# Subaru PCM expects Speed=3 in cam-bus 0x139 to maintain brake hold.
+# Mirrors the MPB Stop-and-Go keepalive signal that prevents ECU timeout.
+_MPB_SPEED_KEEPALIVE = 3
+
 
 def _ctrl(**overrides):
   """Default kwargs for controller update — car moving, MADS off, no pedals."""
@@ -282,15 +286,17 @@ class TestBrakeHoldCarControllerCAN:
     assert name == "Brake_Pedal"
     assert bus == _CAM_BUS
 
-  def test_can_msg_speed_zero(self):
-    """Injected Speed signal must be 3 (MPB keepalive for ECU response)."""
+  def test_can_msg_brake_hold_pedal(self):
+    """Speed in injected 0x139 must be 3 (0.169 kph) — mirrors the MPB Stop-and-Go keepalive
+    signal that prevents Subaru PCM from timing out ACC brake hold. This is the hypothesis
+    under test: whether the same signal activates hold without ACC being engaged."""
     mixin = _make_mixin()
     packer = _make_packer()
     _reach_holding(mixin, packer)
     packer.reset_mock()
     mixin.create_brake_hold(packer, 0, MagicMock(), _make_cc_sp(), _make_cs(brake_pressed=False))
     _, _, values = packer.make_can_msg.call_args[0]
-    assert values["Speed"] == 3
+    assert values["Speed"] == _MPB_SPEED_KEEPALIVE
 
   def test_can_msg_brake_pedal_matches_last_pedal_raw(self):
     """Brake_Pedal signal equals the driver's last recorded value."""
