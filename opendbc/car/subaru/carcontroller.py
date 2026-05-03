@@ -2,11 +2,10 @@ import numpy as np
 from opendbc.can import CANPacker
 from opendbc.car import Bus, make_tester_present_msg
 from opendbc.car.lateral import apply_driver_steer_torque_limits, common_fault_avoidance
-from opendbc.car.interfaces import CarControllerBase
+from opendbc.car.interfaces import CarControllerBase, GearShifter
 from opendbc.car.subaru import subarucan
 from opendbc.car.subaru.values import DBC, GLOBAL_ES_ADDR, CanBus, CarControllerParams, SubaruFlags
 
-from opendbc.sunnypilot.car.subaru.brake_hold import BrakeHoldCarController
 from opendbc.sunnypilot.car.subaru.stop_and_go import SnGCarController
 
 # FIXME: These limits aren't exact. The real limit is more than likely over a larger time period and
@@ -15,15 +14,15 @@ MAX_STEER_RATE = 25  # deg/s
 MAX_STEER_RATE_FRAMES = 7  # tx control frames needed before torque can be cut
 
 
-class CarController(CarControllerBase, SnGCarController, BrakeHoldCarController):
+class CarController(CarControllerBase, SnGCarController):
   def __init__(self, dbc_names, CP, CP_SP):
     CarControllerBase.__init__(self, dbc_names, CP, CP_SP)
     SnGCarController.__init__(self, CP, CP_SP)
-    BrakeHoldCarController.__init__(self, CP, CP_SP)
     self.apply_torque_last = 0
 
     self.cruise_button_prev = 0
     self.steer_rate_counter = 0
+    self._brake_hold_primed = False
 
     self.p = CarControllerParams(CP)
     self.packer = CANPacker(DBC[CP.carFingerprint][Bus.pt])
@@ -144,6 +143,32 @@ class CarController(CarControllerBase, SnGCarController, BrakeHoldCarController)
             bus = CanBus.alt if self.CP.flags & SubaruFlags.GLOBAL_GEN2 else CanBus.main
             can_sends.append(subarucan.create_es_distance(self.packer, CS.es_distance_msg["COUNTER"] + 1, CS.es_distance_msg, bus, pcm_cancel_cmd))
 
+        # BRAKE HOLD — only reachable when openpilotLongitudinalControl=False (structural mutual exclusion)
+        if self.CP.flags & SubaruFlags.BRAKE_HOLD and CS.es_brake_msg is not None:
+          # Velocity-primed latch: capture hold intent during deceleration before mads.active drops at ~0.18 m/s
+          if CC_SP.mads.enabled and CS.out.vEgoRaw < 1.5 and CS.out.brakePressed:
+            if CS.out.gearShifter not in (GearShifter.park, GearShifter.reverse):
+              self._brake_hold_primed = True
+
+          if self.frame % 5 == 0:
+            # AEB override: passthrough Brake_Pressure=0 when Eyesight is asserting AEB
+            if CS.es_brake_msg["AEB_Status"] != 0:
+              holding = False
+            else:
+              holding = (self._brake_hold_primed
+                         and CS.out.standstill
+                         and not CS.out.brakePressed
+                         and not CS.out.gasPressed
+                         and CS.out.gearShifter not in (GearShifter.park, GearShifter.reverse))
+
+            if CS.out.gasPressed or not CC_SP.mads.enabled or CS.out.vEgoRaw > 0.5:
+              self._brake_hold_primed = False
+
+            can_sends.append(subarucan.create_es_brake_hold(
+              self.packer, self.frame // 5, CS.es_brake_msg,
+              CarControllerParams.BRAKE_HOLD_PRESSURE if holding else 0
+            ))
+
       if self.CP.flags & SubaruFlags.DISABLE_EYESIGHT:
         # Tester present (keeps eyesight disabled)
         if self.frame % 100 == 0:
@@ -159,11 +184,7 @@ class CarController(CarControllerBase, SnGCarController, BrakeHoldCarController)
         if self.frame % 2 == 0:
           can_sends.append(subarucan.create_es_static_2(self.packer))
 
-    sng_sends = SnGCarController.create_stop_and_go(self, self.packer, CC, CS, self.frame)
-    if self.is_holding:
-      sng_sends = [m for m in sng_sends if m[0] != 0x139]
-    can_sends.extend(sng_sends)
-    can_sends.extend(BrakeHoldCarController.create_brake_hold(self, self.packer, self.frame, CC, CC_SP, CS))
+    can_sends.extend(SnGCarController.create_stop_and_go(self, self.packer, CC, CS, self.frame))
 
     new_actuators = actuators.as_builder()
     new_actuators.torque = self.apply_torque_last / self.p.STEER_MAX
