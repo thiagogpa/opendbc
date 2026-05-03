@@ -10,10 +10,15 @@
 extern bool subaru_stop_and_go;
 bool subaru_stop_and_go = false;
 
-void subaru_common_init(void) {
-  const uint16_t SUBARU_PARAM_SP_STOP_AND_GO = 1;
+extern bool subaru_brake_intercept;
+bool subaru_brake_intercept = false;
 
-  subaru_stop_and_go = GET_FLAG(current_safety_param_sp, SUBARU_PARAM_SP_STOP_AND_GO);
+void subaru_common_init(void) {
+  const uint16_t SUBARU_PARAM_SP_STOP_AND_GO     = 1U;  // bit 0 — existing
+  const uint16_t SUBARU_PARAM_SP_BRAKE_INTERCEPT = 4U;  // bit 2 — NEW; bit 1 intentionally unused
+
+  subaru_stop_and_go     = GET_FLAG(current_safety_param_sp, SUBARU_PARAM_SP_STOP_AND_GO);
+  subaru_brake_intercept = GET_FLAG(current_safety_param_sp, SUBARU_PARAM_SP_BRAKE_INTERCEPT);
 }
 
 /*
