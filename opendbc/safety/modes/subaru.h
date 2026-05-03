@@ -135,6 +135,19 @@ static void subaru_rx_hook(const CANPacket_t *msg) {
     vehicle_moving = (fr > 0U) || (rr > 0U) || (rl > 0U) || (fl > 0U);
 
     UPDATE_VEHICLE_SPEED((fr + rr + rl + fl) / 4.0 * 0.057 * KPH_TO_MS);
+
+    // RACE-A: hysteresis for brake_intercept — count frames since vehicle_moving=true.
+    // tx_hook uses this to allow ES_Brake hold injections for 3 frames after transition,
+    // covering the ~10ms Python lag at 50Hz Wheel_Speeds (1 frame = 20ms).
+    if (subaru_brake_intercept) {
+      if (vehicle_moving) {
+        if (brake_intercept_release_countdown < BRAKE_INTERCEPT_RELEASE_FRAMES) {
+          brake_intercept_release_countdown++;
+        }
+      } else {
+        brake_intercept_release_countdown = 0;
+      }
+    }
   }
 
   if ((msg->addr == MSG_SUBARU_Brake_Status) && (msg->bus == alt_main_bus)) {
