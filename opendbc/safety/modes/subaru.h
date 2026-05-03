@@ -190,7 +190,19 @@ static bool subaru_tx_hook(const CANPacket_t *msg) {
   // check es_brake brake_pressure limits
   if (msg->addr == MSG_SUBARU_ES_Brake) {
     int es_brake_pressure = GET_BYTES(msg, 2, 2);
-    violation |= longitudinal_brake_checks(es_brake_pressure, SUBARU_LONG_LIMITS);
+
+    if (subaru_brake_intercept && !subaru_longitudinal) {
+      // brake_intercept path: non-zero pressure only allowed at standstill.
+      // RACE-A: allow for BRAKE_INTERCEPT_RELEASE_FRAMES after vehicle_moving=true to cover
+      // the ~10ms Python control loop lag at 50Hz Wheel_Speeds (1 frame = 20ms).
+      // rx_hook counts UP (0 → BRAKE_INTERCEPT_RELEASE_FRAMES); settling while countdown < limit.
+      bool standstill_or_settling = !vehicle_moving || (brake_intercept_release_countdown < BRAKE_INTERCEPT_RELEASE_FRAMES);
+      violation |= (es_brake_pressure > SUBARU_LONG_LIMITS.max_brake);
+      violation |= !controls_allowed && (es_brake_pressure != 0);
+      violation |= !standstill_or_settling && (es_brake_pressure != 0);
+    } else {
+      violation |= longitudinal_brake_checks(es_brake_pressure, SUBARU_LONG_LIMITS);
+    }
   }
 
   // check es_distance cruise_throttle limits
