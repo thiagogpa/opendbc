@@ -198,7 +198,7 @@ static bool subaru_tx_hook(const CANPacket_t *msg) {
       // rx_hook counts UP (0 → BRAKE_INTERCEPT_RELEASE_FRAMES); settling while countdown < limit.
       bool standstill_or_settling = !vehicle_moving || (brake_intercept_release_countdown < BRAKE_INTERCEPT_RELEASE_FRAMES);
       violation |= (es_brake_pressure > SUBARU_LONG_LIMITS.max_brake);
-      violation |= !controls_allowed && (es_brake_pressure != 0);
+      violation |= (!controls_allowed && !controls_allowed_lateral) && (es_brake_pressure != 0);
       violation |= !standstill_or_settling && (es_brake_pressure != 0);
     } else {
       violation |= longitudinal_brake_checks(es_brake_pressure, SUBARU_LONG_LIMITS);

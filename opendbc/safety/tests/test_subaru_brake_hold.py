@@ -170,10 +170,18 @@ class TestSubaruBrakeIntercept(TestSubaruSafetyBase):
     self.assertFalse(self._tx(self._es_brake_msg(601)))
 
   def test_es_brake_requires_controls_allowed_at_standstill(self):
-    """Non-zero pressure with controls_allowed=False → blocked."""
+    """Non-zero pressure blocked only when BOTH controls_allowed and controls_allowed_lateral are False."""
     self._set_standstill()
     self.safety.set_controls_allowed(False)
+    self.safety.set_controls_allowed_lateral(False)
     self.assertFalse(self._tx(self._es_brake_msg(100)))
+
+  def test_es_brake_allowed_with_mads_only_at_standstill(self):
+    """controls_allowed=False but controls_allowed_lateral=True (MADS active, no ACC) → allowed."""
+    self._set_standstill()
+    self.safety.set_controls_allowed(False)
+    self.safety.set_controls_allowed_lateral(True)
+    self.assertTrue(self._tx(self._es_brake_msg(100)))
 
   # ── non-zero pressure when moving (hysteresis exhausted) ────────────────────
 
@@ -243,9 +251,10 @@ class TestSubaruBrakeIntercept(TestSubaruSafetyBase):
     self.assertTrue(self._tx(self._es_brake_msg(100)))
 
   def test_race_a_hysteresis_does_not_bypass_controls_allowed(self):
-    """Even inside the settling window, controls_allowed=False still blocks non-zero."""
+    """Even inside the settling window, both controls_allowed=False AND controls_allowed_lateral=False blocks non-zero."""
     self._set_standstill()
     self.safety.set_controls_allowed(False)
+    self.safety.set_controls_allowed_lateral(False)
     self._set_moving(frames=1)  # inside settling window
     self.assertFalse(self._tx(self._es_brake_msg(100)))
 
