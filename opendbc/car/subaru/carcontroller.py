@@ -6,6 +6,7 @@ from opendbc.car.interfaces import CarControllerBase, GearShifter
 from opendbc.car.subaru import subarucan
 from opendbc.car.subaru.values import DBC, GLOBAL_ES_ADDR, CanBus, CarControllerParams, SubaruFlags
 
+from opendbc.sunnypilot.car.subaru import subarucan_ext
 from opendbc.sunnypilot.car.subaru.stop_and_go import SnGCarController
 
 # FIXME: These limits aren't exact. The real limit is more than likely over a larger time period and
@@ -168,6 +169,12 @@ class CarController(CarControllerBase, SnGCarController):
               self.packer, self.frame // 5, CS.es_brake_msg,
               CarControllerParams.BRAKE_HOLD_PRESSURE if holding else 0
             ))
+
+        # Send masked Brake_Status to camera bus at 50Hz, matching the braking module's rate.
+        # Panda blocks the real 0x13C (ES_Brake=1 during hold) from reaching camera bus;
+        # this copy with ES_Brake=0 prevents Eyesight's ~566ms Cruise_Fault watchdog.
+        if self.CP.flags & SubaruFlags.BRAKE_HOLD and self.frame % 2 == 0 and CS.brake_status_msg is not None:
+          can_sends.append(subarucan_ext.create_brake_status_hold(self.packer, CS.brake_status_msg))
 
       if self.CP.flags & SubaruFlags.DISABLE_EYESIGHT:
         # Tester present (keeps eyesight disabled)

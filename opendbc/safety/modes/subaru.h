@@ -226,6 +226,15 @@ static bool subaru_tx_hook(const CANPacket_t *msg) {
     violation |= longitudinal_transmission_rpm_checks(transmission_rpm, SUBARU_LONG_LIMITS);
   }
 
+  // Brake_Status masking: openpilot sends modified 0x13C to camera bus with ES_Brake bit cleared
+  // so Eyesight never sees ES_Brake feedback from the braking module during hold.
+  // Panda blocks forwarding of the real 0x13C to camera (via check_relay on the tx_msgs entry).
+  if (msg->addr == MSG_SUBARU_Brake_Status) {
+    bool es_brake_bit = (msg->data[7] >> 2) & 1U;
+    violation |= !subaru_brake_intercept;  // only allowed in brake_intercept mode
+    violation |= es_brake_bit;             // ES_Brake bit must be cleared
+  }
+
   if (msg->addr == MSG_SUBARU_ES_UDS_Request) {
     // tester present ('\x02\x3E\x80\x00\x00\x00\x00\x00') is allowed for gen2 longitudinal to keep eyesight disabled
     bool is_tester_present = (GET_BYTES(msg, 0, 4) == 0x00803E02U) && (GET_BYTES(msg, 4, 4) == 0x0U);
@@ -274,11 +283,14 @@ static safety_config subaru_init(uint16_t param) {
   // Brake_Pedal (0x139) included for SnG resume compat — harmless when SnG is not active.
   // Does NOT include full SUBARU_STOP_AND_GO_TX_MSGS (Throttle + Brake_Pedal) because
   // that would block Eyesight's Throttle with no replacement — fatal regression.
+  // Brake_Status (0x13C) to camera bus: check_relay=true blocks panda from forwarding the
+  // real 0x13C (with ES_Brake=1) to Eyesight; openpilot sends a modified copy with ES_Brake=0.
   static const CanMsg subaru_brake_intercept_tx_msgs[] = {
     SUBARU_BASE_TX_MSGS(SUBARU_MAIN_BUS, MSG_SUBARU_ES_LKAS)
     SUBARU_COMMON_TX_MSGS(SUBARU_MAIN_BUS)
-    {MSG_SUBARU_Brake_Pedal, SUBARU_CAM_BUS, 8, .check_relay = true},
-    {MSG_SUBARU_ES_Brake,    SUBARU_MAIN_BUS, 8, .check_relay = true},
+    {MSG_SUBARU_Brake_Pedal,  SUBARU_CAM_BUS,  8, .check_relay = true},
+    {MSG_SUBARU_ES_Brake,     SUBARU_MAIN_BUS, 8, .check_relay = true},
+    {MSG_SUBARU_Brake_Status, SUBARU_CAM_BUS,  8, .check_relay = true},
   };
 
   // SnG + brake-intercept combined: full SnG msgs (Throttle + Brake_Pedal) + ES_Brake.
@@ -287,7 +299,8 @@ static safety_config subaru_init(uint16_t param) {
     SUBARU_BASE_TX_MSGS(SUBARU_MAIN_BUS, MSG_SUBARU_ES_LKAS)
     SUBARU_COMMON_TX_MSGS(SUBARU_MAIN_BUS)
     SUBARU_STOP_AND_GO_TX_MSGS
-    {MSG_SUBARU_ES_Brake,    SUBARU_MAIN_BUS, 8, .check_relay = true},
+    {MSG_SUBARU_ES_Brake,     SUBARU_MAIN_BUS, 8, .check_relay = true},
+    {MSG_SUBARU_Brake_Status, SUBARU_CAM_BUS,  8, .check_relay = true},
   };
 
   static RxCheck subaru_rx_checks[] = {

@@ -35,8 +35,9 @@ from opendbc.safety.tests.test_subaru import (
   TestSubaruSafetyBase,
 )
 
-# Brake_Pedal (0x139) is not in SubaruMsg enum — define locally
-MSG_SUBARU_Brake_Pedal = 0x139
+# Brake_Pedal (0x139) and Brake_Status (0x13C) are not in SubaruMsg enum — define locally
+MSG_SUBARU_Brake_Pedal  = 0x139
+MSG_SUBARU_Brake_Status = 0x13C
 
 BRAKE_INTERCEPT_RELEASE_FRAMES = 3  # must match C #define
 
@@ -49,16 +50,18 @@ class TestSubaruBrakeIntercept(TestSubaruSafetyBase):
   SAFETY_MODEL = CarParams.SafetyModel.subaru
   FLAGS = 0  # gen1, no longitudinal
 
-  # base LKAS msgs + ES_Distance (no relay) + Brake_Pedal + ES_Brake
+  # base LKAS msgs + ES_Distance (no relay) + Brake_Pedal + ES_Brake + Brake_Status
   TX_MSGS = (
-    lkas_tx_msgs(SUBARU_MAIN_BUS)                      # ES_LKAS, ES_DashStatus, ES_LKAS_State, ES_Infotainment + ES_Distance
-    + [[MSG_SUBARU_Brake_Pedal, SUBARU_CAM_BUS]]        # 0x139 cam bus
-    + [[SubaruMsg.ES_Brake,    SUBARU_MAIN_BUS]]       # 0x220 main bus
+    lkas_tx_msgs(SUBARU_MAIN_BUS)                           # ES_LKAS, ES_DashStatus, ES_LKAS_State, ES_Infotainment + ES_Distance
+    + [[MSG_SUBARU_Brake_Pedal,  SUBARU_CAM_BUS]]           # 0x139 cam bus
+    + [[SubaruMsg.ES_Brake,      SUBARU_MAIN_BUS]]          # 0x220 main bus
+    + [[MSG_SUBARU_Brake_Status, SUBARU_CAM_BUS]]           # 0x13C cam bus (masked copy, ES_Brake=0)
   )
 
   # Relay malfunction fires when received (addr,bus) matches a check_relay=true TX entry.
   # ES_Brake TX bus = MAIN_BUS → relay malfunction if ES_Brake seen on MAIN_BUS.
   # Brake_Pedal TX bus = CAM_BUS → relay malfunction if Brake_Pedal seen on CAM_BUS.
+  # Brake_Status TX bus = CAM_BUS → relay malfunction if Brake_Status seen on CAM_BUS.
   RELAY_MALFUNCTION_ADDRS = {
     SUBARU_MAIN_BUS: (
       SubaruMsg.ES_LKAS,
@@ -69,12 +72,15 @@ class TestSubaruBrakeIntercept(TestSubaruSafetyBase):
     ),
     SUBARU_CAM_BUS: (
       MSG_SUBARU_Brake_Pedal,
+      MSG_SUBARU_Brake_Status,
     ),
   }
 
   # Forwarding block logic: check_relay=true entry with bus=destination_bus → fwd returns -1.
-  # ES_Brake (0x220): TX entry bus=MAIN_BUS → blocked when arriving from CAM_BUS (destination=MAIN).
-  # Brake_Pedal (0x139): TX entry bus=CAM_BUS → blocked when arriving from MAIN_BUS (destination=CAM).
+  # FWD_BLACKLISTED_ADDRS keys = source bus (the bus the message ARRIVES from).
+  # ES_Brake (0x220): TX bus=MAIN_BUS → blocked arriving from CAM_BUS (src=CAM, dst=MAIN).
+  # Brake_Pedal (0x139): TX bus=CAM_BUS → blocked arriving from MAIN_BUS (src=MAIN, dst=CAM).
+  # Brake_Status (0x13C): TX bus=CAM_BUS → blocked arriving from MAIN_BUS (src=MAIN, dst=CAM).
   FWD_BLACKLISTED_ADDRS = {
     SUBARU_CAM_BUS: [
       SubaruMsg.ES_LKAS,
@@ -85,6 +91,7 @@ class TestSubaruBrakeIntercept(TestSubaruSafetyBase):
     ],
     SUBARU_MAIN_BUS: [
       MSG_SUBARU_Brake_Pedal,
+      MSG_SUBARU_Brake_Status,
     ],
   }
 
@@ -265,6 +272,39 @@ class TestSubaruBrakeIntercept(TestSubaruSafetyBase):
     self._set_moving(frames=1)  # inside settling window
     self.assertFalse(self._tx(self._es_brake_msg(601)))
 
+  # ── Brake_Status (0x13C) masking tx_hook ────────────────────────────────────
+
+  def _brake_status_msg(self, es_brake_bit):
+    """Build a Brake_Status CAN message with the ES_Brake bit set or cleared.
+    ES_Brake is bit 2 of byte 7 (bit 58 overall) per subaru_global_2017_generated.dbc."""
+    # The packer doesn't expose a named ES_Brake signal in Brake_Status directly via
+    # the safety packer, so build the raw byte manually.
+    values = {"ES_Brake": es_brake_bit, "Brake": 0}
+    return self.packer.make_can_msg_safety("Brake_Status", SUBARU_CAM_BUS, values)
+
+  def test_brake_status_allowed_es_brake_cleared(self):
+    """Brake_Status with ES_Brake=0 to cam bus must be allowed in brake_intercept mode."""
+    self.safety.set_controls_allowed(True)
+    self.assertTrue(self._tx(self._brake_status_msg(0)))
+
+  def test_brake_status_blocked_es_brake_set(self):
+    """Brake_Status with ES_Brake=1 must be blocked — panda must never forward this to Eyesight."""
+    self.safety.set_controls_allowed(True)
+    self.assertFalse(self._tx(self._brake_status_msg(1)))
+
+  def test_brake_status_allowed_controls_off(self):
+    """Brake_Status masking is not gated on controls_allowed — always needed during hold."""
+    self.safety.set_controls_allowed(False)
+    self.assertTrue(self._tx(self._brake_status_msg(0)))
+
+  def test_brake_status_blocked_without_brake_intercept(self):
+    """In non-brake_intercept mode, Brake_Status is not in TX allowlist → blocked."""
+    self.safety.set_current_safety_param_sp(0)  # no SP flags
+    self.safety.set_safety_hooks(CarParams.SafetyModel.subaru, 0)
+    self.safety.init_tests()
+    self.safety.set_controls_allowed(True)
+    self.assertFalse(self._tx(self._brake_status_msg(0)))
+
   # ── brake_intercept absent → ES_Brake not in allowlist ──────────────────────
 
   def test_no_brake_intercept_es_brake_blocked(self):
@@ -299,13 +339,14 @@ class TestSubaruSnGBrakeIntercept(TestSubaruBrakeIntercept):
   """
   Gen1, SnG + brake_intercept SP params combined.
   TX allowlist: base LKAS + ES_Distance (no relay) + Throttle (cam, relay)
-                + Brake_Pedal (cam, relay) + ES_Brake (main, relay).
+                + Brake_Pedal (cam, relay) + ES_Brake (main, relay) + Brake_Status (cam, relay).
   """
   TX_MSGS = (
     lkas_tx_msgs(SUBARU_MAIN_BUS)
-    + [[SubaruMsg.Throttle,   SUBARU_CAM_BUS]]
-    + [[MSG_SUBARU_Brake_Pedal, SUBARU_CAM_BUS]]
-    + [[SubaruMsg.ES_Brake,   SUBARU_MAIN_BUS]]
+    + [[SubaruMsg.Throttle,        SUBARU_CAM_BUS]]
+    + [[MSG_SUBARU_Brake_Pedal,    SUBARU_CAM_BUS]]
+    + [[SubaruMsg.ES_Brake,        SUBARU_MAIN_BUS]]
+    + [[MSG_SUBARU_Brake_Status,   SUBARU_CAM_BUS]]
   )
 
   RELAY_MALFUNCTION_ADDRS = {
@@ -319,10 +360,12 @@ class TestSubaruSnGBrakeIntercept(TestSubaruBrakeIntercept):
     SUBARU_CAM_BUS: (
       SubaruMsg.Throttle,
       MSG_SUBARU_Brake_Pedal,
+      MSG_SUBARU_Brake_Status,
     ),
   }
 
-  # Throttle TX bus=CAM_BUS (check_relay) → fwd blocked when Throttle from MAIN_BUS
+  # Throttle TX bus=CAM_BUS → blocked arriving from MAIN_BUS (src=MAIN, dst=CAM).
+  # Brake_Status TX bus=CAM_BUS → blocked arriving from MAIN_BUS (src=MAIN, dst=CAM).
   FWD_BLACKLISTED_ADDRS = {
     SUBARU_CAM_BUS: [
       SubaruMsg.ES_LKAS,
@@ -334,6 +377,7 @@ class TestSubaruSnGBrakeIntercept(TestSubaruBrakeIntercept):
     SUBARU_MAIN_BUS: [
       SubaruMsg.Throttle,
       MSG_SUBARU_Brake_Pedal,
+      MSG_SUBARU_Brake_Status,
     ],
   }
 
@@ -385,6 +429,14 @@ class TestSubaruSnGBrakeIntercept(TestSubaruBrakeIntercept):
     self.safety.set_controls_allowed(True)
     self.assertFalse(self._tx(self._es_brake_msg(0)))
     self.assertFalse(self._tx(self._es_brake_msg(100)))
+
+  def test_brake_status_blocked_without_brake_intercept(self):
+    """In SnG-only mode (no brake_intercept), Brake_Status not in allowlist → blocked."""
+    self.safety.set_current_safety_param_sp(SubaruSafetyFlagsSP.STOP_AND_GO)
+    self.safety.set_safety_hooks(CarParams.SafetyModel.subaru, 0)
+    self.safety.init_tests()
+    self.safety.set_controls_allowed(True)
+    self.assertFalse(self._tx(self._brake_status_msg(0)))
 
 
 if __name__ == "__main__":
