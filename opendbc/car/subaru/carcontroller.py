@@ -158,7 +158,6 @@ class CarController(CarControllerBase, SnGCarController):
             else:
               holding = (self._brake_hold_primed
                          and CS.out.standstill
-                         and not CS.out.brakePressed
                          and not CS.out.gasPressed
                          and CS.out.gearShifter not in (GearShifter.park, GearShifter.reverse))
 
