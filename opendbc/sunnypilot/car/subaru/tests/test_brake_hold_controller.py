@@ -1,10 +1,7 @@
 """
-TDD tests for brake hold logic in CarController.update().
+Tests for brake hold logic in CarController.update().
 
-These tests are written BEFORE the implementation is added to
-opendbc_repo/opendbc/car/subaru/carcontroller.py.
-
-Logic under test (to be added to update(), inside `else` branch):
+Logic under test (opendbc_repo/opendbc/car/subaru/carcontroller.py, inside `else` branch):
 
   if self.CP.flags & SubaruFlags.BRAKE_HOLD and CS.es_brake_msg is not None:
       # velocity-primed latch
@@ -13,21 +10,25 @@ Logic under test (to be added to update(), inside `else` branch):
               self._brake_hold_primed = True
 
       if self.frame % 5 == 0:
-          if CS.es_brake_msg["AEB_Status"] != 0:
-              holding = False
-          else:
-              holding = (self._brake_hold_primed
-                         and CS.out.standstill
-                         and not CS.out.brakePressed
-                         and not CS.out.gasPressed
-                         and CS.out.gearShifter not in (GearShifter.park, GearShifter.reverse))
+          holding = (self._brake_hold_primed
+                     and CS.out.standstill
+                     and not CS.out.gasPressed
+                     and CS.out.gearShifter not in (GearShifter.park, GearShifter.reverse))
 
           if CS.out.gasPressed or not CC_SP.mads.enabled or CS.out.vEgoRaw > 0.5:
               self._brake_hold_primed = False
 
+          # AEB safety: echo EyeSight's own Brake_Pressure when it asserts AEB.
+          if CS.es_brake_msg["AEB_Status"] != 0:
+              brake_value = CS.es_brake_msg["Brake_Pressure"]
+          elif holding:
+              brake_value = CarControllerParams.BRAKE_HOLD_PRESSURE
+          else:
+              brake_value = 0
+
           can_sends.append(subarucan.create_es_brake_hold(
               self.packer, self.frame // 5, CS.es_brake_msg,
-              CarControllerParams.BRAKE_HOLD_PRESSURE if holding else 0
+              brake_value
           ))
 """
 
@@ -253,14 +254,14 @@ class TestBrakeHoldController:
                          CS=make_CS(standstill=False, brakePressed=False, gasPressed=False))
     assert self._get_brake_value(mock_bh) == 0
 
-  def test_holding_requires_brake_released(self):
-    """primed=True, standstill=True, brakePressed=True → brake_value=0 (driver still on brake)."""
+  def test_holding_active_while_brake_pressed(self):
+    """primed=True, standstill=True, brakePressed=True → hold activates (seamless hold, foot still on pedal)."""
     ctrl = make_ctrl()
     ctrl.frame = 0
     ctrl._brake_hold_primed = True
     mock_bh = run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
                          CS=make_CS(standstill=True, brakePressed=True, gasPressed=False))
-    assert self._get_brake_value(mock_bh) == 0
+    assert self._get_brake_value(mock_bh) == CarControllerParams.BRAKE_HOLD_PRESSURE
 
   def test_holding_blocked_if_gas_pressed(self):
     """primed=True, standstill=True, gasPressed=True → brake_value=0."""
@@ -292,14 +293,17 @@ class TestBrakeHoldController:
     assert self._get_brake_value(mock_bh) == CarControllerParams.BRAKE_HOLD_PRESSURE
 
   def test_aeb_overrides_hold(self):
-    """AEB_Status != 0 → brake_value=0 even when all hold conditions met."""
+    """AEB_Status != 0 → brake_value passes through EyeSight's Brake_Pressure, not hold pressure."""
     ctrl = make_ctrl()
     ctrl.frame = 0
     ctrl._brake_hold_primed = True
+    aeb_es_msg = {"AEB_Status": 8, "CHECKSUM": 0, "Signal1": 0, "Brake_Pressure": 450,
+                  "Cruise_Brake_Lights": 0, "Cruise_Brake_Fault": 0, "Cruise_Brake_Active": 0,
+                  "Cruise_Activated": 0, "Signal3": 0}
     mock_bh = run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
                          CS=make_CS(standstill=True, brakePressed=False,
-                                    gasPressed=False, aeb_status=8))
-    assert self._get_brake_value(mock_bh) == 0
+                                    gasPressed=False, es_brake_msg=aeb_es_msg))
+    assert self._get_brake_value(mock_bh) == 450
 
   def test_aeb_zero_does_not_override(self):
     """AEB_Status=0 → normal hold logic, brake_value == BRAKE_HOLD_PRESSURE."""
@@ -310,6 +314,19 @@ class TestBrakeHoldController:
                          CS=make_CS(standstill=True, brakePressed=False,
                                     gasPressed=False, aeb_status=0))
     assert self._get_brake_value(mock_bh) == CarControllerParams.BRAKE_HOLD_PRESSURE
+
+  def test_aeb_while_moving_passthrough(self):
+    """AEB fires while car is moving (standstill=False, not holding) → passthrough EyeSight's Brake_Pressure."""
+    ctrl = make_ctrl()
+    ctrl.frame = 0
+    ctrl._brake_hold_primed = False
+    aeb_es_msg = {"AEB_Status": 4, "CHECKSUM": 0, "Signal1": 0, "Brake_Pressure": 600,
+                  "Cruise_Brake_Lights": 1, "Cruise_Brake_Fault": 0, "Cruise_Brake_Active": 1,
+                  "Cruise_Activated": 0, "Signal3": 0}
+    mock_bh = run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
+                         CS=make_CS(standstill=False, brakePressed=False,
+                                    gasPressed=False, vEgoRaw=8.0, es_brake_msg=aeb_es_msg))
+    assert self._get_brake_value(mock_bh) == 600
 
   # -----------------------------------------------------------------------
   # 15–17. Latch reset (inside frame%5 == 0)

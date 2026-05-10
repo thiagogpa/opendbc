@@ -152,21 +152,26 @@ class CarController(CarControllerBase, SnGCarController):
               self._brake_hold_primed = True
 
           if self.frame % 5 == 0:
-            # AEB override: passthrough Brake_Pressure=0 when Eyesight is asserting AEB
-            if CS.es_brake_msg["AEB_Status"] != 0:
-              holding = False
-            else:
-              holding = (self._brake_hold_primed
-                         and CS.out.standstill
-                         and not CS.out.gasPressed
-                         and CS.out.gearShifter not in (GearShifter.park, GearShifter.reverse))
+            holding = (self._brake_hold_primed
+                       and CS.out.standstill
+                       and not CS.out.gasPressed
+                       and CS.out.gearShifter not in (GearShifter.park, GearShifter.reverse))
 
             if CS.out.gasPressed or not CC_SP.mads.enabled or CS.out.vEgoRaw > 0.5:
               self._brake_hold_primed = False
 
+            # AEB safety: echo EyeSight's own Brake_Pressure when it asserts AEB.
+            # Sending 0 instead would override the AEB command and suppress braking.
+            if CS.es_brake_msg["AEB_Status"] != 0:
+              brake_value = CS.es_brake_msg["Brake_Pressure"]
+            elif holding:
+              brake_value = CarControllerParams.BRAKE_HOLD_PRESSURE
+            else:
+              brake_value = 0
+
             can_sends.append(subarucan.create_es_brake_hold(
               self.packer, self.frame // 5, CS.es_brake_msg,
-              CarControllerParams.BRAKE_HOLD_PRESSURE if holding else 0
+              brake_value
             ))
 
         # Send masked Brake_Status to camera bus at 50Hz, matching the braking module's rate.
