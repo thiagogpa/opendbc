@@ -40,6 +40,7 @@ MSG_SUBARU_Brake_Pedal  = 0x139
 MSG_SUBARU_Brake_Status = 0x13C
 
 BRAKE_INTERCEPT_RELEASE_FRAMES = 3  # must match C #define
+SUBARU_BRAKE_HOLD_ACTIVE_FRAMES = 4  # must match C #define (~200ms at 20Hz Wheel_Speeds)
 
 
 class TestSubaruBrakeIntercept(TestSubaruSafetyBase):
@@ -76,22 +77,22 @@ class TestSubaruBrakeIntercept(TestSubaruSafetyBase):
     ),
   }
 
-  # Forwarding block logic: check_relay=true entry with bus=destination_bus → fwd returns -1.
+  # Forwarding block logic: check_relay=true entry with bus=destination_bus → fwd returns -1
+  # UNLESS disable_static_blocking=true (see ES_Brake & Brake_Status below — those are
+  # conditionally blocked via subaru_fwd_hook only while a hold is actively being injected).
   # FWD_BLACKLISTED_ADDRS keys = source bus (the bus the message ARRIVES from).
-  # ES_Brake (0x220): TX bus=MAIN_BUS → blocked arriving from CAM_BUS (src=CAM, dst=MAIN).
+  # ES_Brake (0x220): conditionally blocked CAM→MAIN — covered by TestSubaruBrakeHoldFwd.
   # Brake_Pedal (0x139): TX bus=CAM_BUS → blocked arriving from MAIN_BUS (src=MAIN, dst=CAM).
-  # Brake_Status (0x13C): TX bus=CAM_BUS → blocked arriving from MAIN_BUS (src=MAIN, dst=CAM).
+  # Brake_Status (0x13C): conditionally blocked MAIN→CAM — covered by TestSubaruBrakeHoldFwd.
   FWD_BLACKLISTED_ADDRS = {
     SUBARU_CAM_BUS: [
       SubaruMsg.ES_LKAS,
       SubaruMsg.ES_DashStatus,
       SubaruMsg.ES_LKAS_State,
       SubaruMsg.ES_Infotainment,
-      SubaruMsg.ES_Brake,
     ],
     SUBARU_MAIN_BUS: [
       MSG_SUBARU_Brake_Pedal,
-      MSG_SUBARU_Brake_Status,
     ],
   }
 
@@ -334,6 +335,131 @@ class TestSubaruBrakeIntercept(TestSubaruSafetyBase):
     self.assertFalse(self._tx(self._es_brake_msg(0)))
     self.assertFalse(self._tx(self._es_brake_msg(100)))
 
+  # ── ACC-fault fix (2026-05-11): conditional forwarding ──────────────────────
+  #
+  # Background: in brake-intercept mode, Panda used to UNCONDITIONALLY block
+  # ES_Brake (CAM→MAIN) and Brake_Status (MAIN→CAM) forwarding. This broke
+  # Eyesight's native ACC braking: Eyesight's ES_Brake never reached the braking
+  # module, and the module's Brake_Status (ES_Brake=1 confirmation) never
+  # reached Eyesight → Cruise_Fault watchdog within ~566ms.
+  #
+  # Fix: forwarding is CONDITIONALLY blocked only while we are actively asserting
+  # a hold. The active-hold state is tracked via a Wheel_Speeds-paced countdown
+  # set on TX of ES_Brake (Brake_Pressure>0) or Brake_Status (the mask).
+
+  def _brake_status_mask_msg(self):
+    return self.packer.make_can_msg_safety("Brake_Status", SUBARU_CAM_BUS,
+                                           {"ES_Brake": 0, "Brake": 0})
+
+  def _tx_hold_pressure(self):
+    """TX one ES_Brake with Brake_Pressure>0 — should set the active-hold countdown."""
+    self._set_standstill()
+    self.safety.set_controls_allowed(True)
+    self.assertTrue(self._tx(self._es_brake_msg(400)))
+
+  def _tx_brake_status_mask(self):
+    """TX the masked Brake_Status — should also set the active-hold countdown."""
+    self.safety.set_controls_allowed(True)
+    self.assertTrue(self._tx(self._brake_status_mask_msg()))
+
+  def _pump_wheel_speeds(self, n):
+    """Advance the countdown by n Wheel_Speeds RX frames."""
+    for _ in range(n):
+      self._rx(self._speed_msg(0))
+
+  def test_fwd_es_brake_cam_to_main_allowed_when_idle(self):
+    """At setUp (no hold TX yet) — ES_Brake CAM→MAIN must forward (destination 0)."""
+    self.assertEqual(SUBARU_MAIN_BUS,
+                     self.safety.safety_fwd_hook(SUBARU_CAM_BUS, SubaruMsg.ES_Brake))
+
+  def test_fwd_brake_status_main_to_cam_allowed_when_idle(self):
+    """At idle — Brake_Status MAIN→CAM must forward (destination 2)."""
+    self.assertEqual(SUBARU_CAM_BUS,
+                     self.safety.safety_fwd_hook(SUBARU_MAIN_BUS, MSG_SUBARU_Brake_Status))
+
+  def test_fwd_es_brake_cam_to_main_blocked_after_hold_tx(self):
+    """After TXing ES_Brake with Brake_Pressure>0 — relay CAM→MAIN must be blocked."""
+    self._tx_hold_pressure()
+    self.assertEqual(-1, self.safety.safety_fwd_hook(SUBARU_CAM_BUS, SubaruMsg.ES_Brake))
+
+  def test_fwd_brake_status_main_to_cam_blocked_after_hold_tx(self):
+    """After TXing ES_Brake hold — Brake_Status MAIN→CAM must be blocked."""
+    self._tx_hold_pressure()
+    self.assertEqual(-1,
+                     self.safety.safety_fwd_hook(SUBARU_MAIN_BUS, MSG_SUBARU_Brake_Status))
+
+  def test_fwd_brake_status_main_to_cam_blocked_after_mask_tx(self):
+    """After TXing the Brake_Status mask — forwarding must be blocked too."""
+    self._tx_brake_status_mask()
+    self.assertEqual(-1,
+                     self.safety.safety_fwd_hook(SUBARU_MAIN_BUS, MSG_SUBARU_Brake_Status))
+
+  def test_fwd_remains_blocked_during_countdown(self):
+    """Within SUBARU_BRAKE_HOLD_ACTIVE_FRAMES of a hold TX, forwarding stays blocked."""
+    self._tx_hold_pressure()
+    for k in range(SUBARU_BRAKE_HOLD_ACTIVE_FRAMES - 1):
+      self._pump_wheel_speeds(1)
+      with self.subTest(after_pumps=k + 1):
+        self.assertEqual(-1, self.safety.safety_fwd_hook(SUBARU_CAM_BUS, SubaruMsg.ES_Brake))
+        self.assertEqual(-1, self.safety.safety_fwd_hook(SUBARU_MAIN_BUS, MSG_SUBARU_Brake_Status))
+
+  def test_fwd_restored_after_countdown_expires(self):
+    """After SUBARU_BRAKE_HOLD_ACTIVE_FRAMES Wheel_Speeds RX, forwarding is restored."""
+    self._tx_hold_pressure()
+    self._pump_wheel_speeds(SUBARU_BRAKE_HOLD_ACTIVE_FRAMES)
+    self.assertEqual(SUBARU_MAIN_BUS,
+                     self.safety.safety_fwd_hook(SUBARU_CAM_BUS, SubaruMsg.ES_Brake))
+    self.assertEqual(SUBARU_CAM_BUS,
+                     self.safety.safety_fwd_hook(SUBARU_MAIN_BUS, MSG_SUBARU_Brake_Status))
+
+  def test_fwd_blocked_retriggered_by_subsequent_hold_tx(self):
+    """A new hold TX after countdown expired must re-block forwarding."""
+    self._tx_hold_pressure()
+    self._pump_wheel_speeds(SUBARU_BRAKE_HOLD_ACTIVE_FRAMES)
+    self.assertEqual(SUBARU_MAIN_BUS,
+                     self.safety.safety_fwd_hook(SUBARU_CAM_BUS, SubaruMsg.ES_Brake))
+    self._set_standstill()
+    self.assertTrue(self._tx(self._es_brake_msg(400)))
+    self.assertEqual(-1, self.safety.safety_fwd_hook(SUBARU_CAM_BUS, SubaruMsg.ES_Brake))
+
+  def test_fwd_not_blocked_after_zero_pressure_tx(self):
+    """TXing ES_Brake with Brake_Pressure=0 must NOT engage the hold gate."""
+    self.safety.set_controls_allowed(True)
+    self.assertTrue(self._tx(self._es_brake_msg(0)))
+    self.assertEqual(SUBARU_MAIN_BUS,
+                     self.safety.safety_fwd_hook(SUBARU_CAM_BUS, SubaruMsg.ES_Brake))
+    self.assertEqual(SUBARU_CAM_BUS,
+                     self.safety.safety_fwd_hook(SUBARU_MAIN_BUS, MSG_SUBARU_Brake_Status))
+
+  def test_fwd_es_brake_restored_for_aeb_after_hold_release(self):
+    """
+    AEB-while-moving relay test.
+
+    Scenario: driver was held at standstill (AVH active), then accelerated.
+    While moving, Eyesight triggers AEB. Eyesight sends its own ES_Brake on
+    the cam bus — Panda must relay it to the braking module (cam→main).
+
+    Sequence:
+      1. Hold engaged → hold TX sets the active-hold countdown.
+      2. Driver releases hold (gas press) → Python stops sending hold TXes.
+      3. Car moves → SUBARU_BRAKE_HOLD_ACTIVE_FRAMES Wheel_Speeds frames expire
+         the countdown.
+      4. AEB fires → Eyesight's ES_Brake appears on cam bus.
+         Panda must forward it (return SUBARU_MAIN_BUS), not block it (-1).
+    """
+    # Step 1: hold TX (sets countdown)
+    self._tx_hold_pressure()
+    self.assertEqual(-1, self.safety.safety_fwd_hook(SUBARU_CAM_BUS, SubaruMsg.ES_Brake),
+                     "relay must be blocked during hold")
+
+    # Step 2+3: hold released, countdown decays as car moves
+    self._pump_wheel_speeds(SUBARU_BRAKE_HOLD_ACTIVE_FRAMES)
+
+    # Step 4: AEB fires — Eyesight's ES_Brake (cam→main) must be forwarded
+    self.assertEqual(SUBARU_MAIN_BUS,
+                     self.safety.safety_fwd_hook(SUBARU_CAM_BUS, SubaruMsg.ES_Brake),
+                     "Eyesight AEB ES_Brake must reach braking module after hold release")
+
 
 class TestSubaruSnGBrakeIntercept(TestSubaruBrakeIntercept):
   """
@@ -365,19 +491,17 @@ class TestSubaruSnGBrakeIntercept(TestSubaruBrakeIntercept):
   }
 
   # Throttle TX bus=CAM_BUS → blocked arriving from MAIN_BUS (src=MAIN, dst=CAM).
-  # Brake_Status TX bus=CAM_BUS → blocked arriving from MAIN_BUS (src=MAIN, dst=CAM).
+  # ES_Brake & Brake_Status: conditional — see TestSubaruBrakeHoldFwd.
   FWD_BLACKLISTED_ADDRS = {
     SUBARU_CAM_BUS: [
       SubaruMsg.ES_LKAS,
       SubaruMsg.ES_DashStatus,
       SubaruMsg.ES_LKAS_State,
       SubaruMsg.ES_Infotainment,
-      SubaruMsg.ES_Brake,
     ],
     SUBARU_MAIN_BUS: [
       SubaruMsg.Throttle,
       MSG_SUBARU_Brake_Pedal,
-      MSG_SUBARU_Brake_Status,
     ],
   }
 

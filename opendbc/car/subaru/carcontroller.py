@@ -24,6 +24,7 @@ class CarController(CarControllerBase, SnGCarController):
     self.cruise_button_prev = 0
     self.steer_rate_counter = 0
     self._brake_hold_primed = False
+    self._brake_hold_active = False
 
     self.p = CarControllerParams(CP)
     self.packer = CANPacker(DBC[CP.carFingerprint][Bus.pt])
@@ -145,6 +146,9 @@ class CarController(CarControllerBase, SnGCarController):
             can_sends.append(subarucan.create_es_distance(self.packer, CS.es_distance_msg["COUNTER"] + 1, CS.es_distance_msg, bus, pcm_cancel_cmd))
 
         # BRAKE HOLD — only reachable when openpilotLongitudinalControl=False (structural mutual exclusion)
+        # Both ES_Brake hold injections and Brake_Status mask are gated on `_brake_hold_active`.
+        # When not actively holding/AEB, stay out of the way so Eyesight's own ACC ES_Brake
+        # can reach the braking module and the module's Brake_Status feedback can reach Eyesight.
         if self.CP.flags & SubaruFlags.BRAKE_HOLD and CS.es_brake_msg is not None:
           # Velocity-primed latch: capture hold intent during deceleration before mads.active drops at ~0.18 m/s
           if CC_SP.mads.enabled and CS.out.vEgoRaw < 1.5 and CS.out.brakePressed:
@@ -161,23 +165,27 @@ class CarController(CarControllerBase, SnGCarController):
               self._brake_hold_primed = False
 
             # AEB safety: echo EyeSight's own Brake_Pressure when it asserts AEB.
-            # Sending 0 instead would override the AEB command and suppress braking.
-            if CS.es_brake_msg["AEB_Status"] != 0:
+            aeb_active = CS.es_brake_msg["AEB_Status"] != 0
+            if aeb_active:
               brake_value = CS.es_brake_msg["Brake_Pressure"]
             elif holding:
               brake_value = CarControllerParams.BRAKE_HOLD_PRESSURE
             else:
-              brake_value = 0
+              brake_value = None  # stay out of Eyesight's way
 
-            can_sends.append(subarucan.create_es_brake_hold(
-              self.packer, self.frame // 5, CS.es_brake_msg,
-              brake_value
-            ))
+            self._brake_hold_active = aeb_active or holding
 
-        # Send masked Brake_Status to camera bus at 50Hz, matching the braking module's rate.
-        # Panda blocks the real 0x13C (ES_Brake=1 during hold) from reaching camera bus;
-        # this copy with ES_Brake=0 prevents Eyesight's ~566ms Cruise_Fault watchdog.
-        if self.CP.flags & SubaruFlags.BRAKE_HOLD and self.frame % 2 == 0 and CS.brake_status_msg is not None:
+            if brake_value is not None:
+              can_sends.append(subarucan.create_es_brake_hold(
+                self.packer, self.frame // 5, CS.es_brake_msg,
+                brake_value
+              ))
+
+        # Send masked Brake_Status to camera bus at 50Hz ONLY while actively asserting hold/AEB.
+        # When not active, Panda will forward the real Brake_Status so Eyesight sees ACC
+        # feedback (ES_Brake bit). The 50Hz cadence matches the braking module's rate.
+        if (self.CP.flags & SubaruFlags.BRAKE_HOLD and self.frame % 2 == 0
+            and CS.brake_status_msg is not None and self._brake_hold_active):
           can_sends.append(subarucan_ext.create_brake_status_hold(self.packer, CS.brake_status_msg))
 
       if self.CP.flags & SubaruFlags.DISABLE_EYESIGHT:

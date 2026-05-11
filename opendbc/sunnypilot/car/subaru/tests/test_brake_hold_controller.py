@@ -45,6 +45,7 @@ from opendbc.car.interfaces import GearShifter
 # ---------------------------------------------------------------------------
 
 _DUMMY_MSG = ("ES_Brake", bytes(8), 0)
+_DUMMY_BS_MSG = ("Brake_Status", bytes(8), 2)
 _DBC_NAMES = DBC[CAR.SUBARU_IMPREZA_2020.value]
 
 
@@ -109,6 +110,10 @@ def make_CS(
     }
   else:
     CS.es_brake_msg = es_brake_msg
+  CS.brake_status_msg = {
+    "CHECKSUM": 0, "COUNTER": 0, "Signal1": 0, "ES_Brake": 0,
+    "Signal2": 0, "Brake": 0, "Signal3": 0,
+  }
   CS.cruise_button = 0
   # SnGCarController fields (unused unless SnG enabled on CP_SP)
   CS.throttle_msg = {}
@@ -127,6 +132,7 @@ _STEERING_PATCH = patch("opendbc.car.subaru.subarucan.create_steering_control", 
 _DASHSTATUS_PATCH = patch("opendbc.car.subaru.subarucan.create_es_dashstatus", return_value=_DUMMY_MSG)
 _LKAS_STATE_PATCH = patch("opendbc.car.subaru.subarucan.create_es_lkas_state", return_value=_DUMMY_MSG)
 _BRAKE_HOLD_PATCH = "opendbc.car.subaru.subarucan.create_es_brake_hold"
+_BRAKE_STATUS_HOLD_PATCH = "opendbc.sunnypilot.car.subaru.subarucan_ext.create_brake_status_hold"
 
 
 def run_update(ctrl, CC=None, CC_SP=None, CS=None):
@@ -138,24 +144,22 @@ def run_update(ctrl, CC=None, CC_SP=None, CS=None):
   CC_SP = CC_SP or make_CC_SP()
   CS = CS or make_CS()
   with _STEERING_PATCH, _DASHSTATUS_PATCH, _LKAS_STATE_PATCH, \
-       patch(_BRAKE_HOLD_PATCH, return_value=_DUMMY_MSG) as mock_bh:
+       patch(_BRAKE_HOLD_PATCH, return_value=_DUMMY_MSG) as mock_bh, \
+       patch(_BRAKE_STATUS_HOLD_PATCH, return_value=_DUMMY_BS_MSG):
     ctrl.update(CC, CC_SP, CS, 0)
   return mock_bh
 
 
-def run_update_capture_mock(ctrl, CC=None, CC_SP=None, CS=None):
-  """Run one ctrl.update() inside an active patch context.
-
-  Returns (mock_bh, actuators) so callers can do assertions after the `with`.
-  Used when the caller needs to inspect mock state INSIDE a single context.
-  """
+def run_update_capture_both(ctrl, CC=None, CC_SP=None, CS=None):
+  """Run one ctrl.update() and return (mock_es_brake_hold, mock_brake_status_hold)."""
   CC = CC or make_CC()
   CC_SP = CC_SP or make_CC_SP()
   CS = CS or make_CS()
-  with _STEERING_PATCH, _DASHSTATUS_PATCH, _LKAS_STATE_PATCH:
-    with patch(_BRAKE_HOLD_PATCH, return_value=_DUMMY_MSG) as mock_bh:
-      ctrl.update(CC, CC_SP, CS, 0)
-      return mock_bh
+  with _STEERING_PATCH, _DASHSTATUS_PATCH, _LKAS_STATE_PATCH, \
+       patch(_BRAKE_HOLD_PATCH, return_value=_DUMMY_MSG) as mock_bh, \
+       patch(_BRAKE_STATUS_HOLD_PATCH, return_value=_DUMMY_BS_MSG) as mock_bsh:
+    ctrl.update(CC, CC_SP, CS, 0)
+  return mock_bh, mock_bsh
 
 
 # ---------------------------------------------------------------------------
@@ -237,22 +241,22 @@ class TestBrakeHoldController:
     return mock_bh.call_args[0][3]  # (packer, frame, es_brake_msg, brake_value)
 
   def test_holding_requires_primed(self):
-    """primed=False, standstill=True → brake_value=0 (no hold)."""
+    """primed=False, standstill=True → no create_es_brake_hold call (stay out of Eyesight's way)."""
     ctrl = make_ctrl()
     ctrl.frame = 0
     ctrl._brake_hold_primed = False
     mock_bh = run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
                          CS=make_CS(standstill=True, brakePressed=False, gasPressed=False))
-    assert self._get_brake_value(mock_bh) == 0
+    assert not mock_bh.called
 
   def test_holding_requires_standstill(self):
-    """primed=True, standstill=False → brake_value=0."""
+    """primed=True, standstill=False → no create_es_brake_hold call (ACC may be braking)."""
     ctrl = make_ctrl()
     ctrl.frame = 0
     ctrl._brake_hold_primed = True
     mock_bh = run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
                          CS=make_CS(standstill=False, brakePressed=False, gasPressed=False))
-    assert self._get_brake_value(mock_bh) == 0
+    assert not mock_bh.called
 
   def test_holding_active_while_brake_pressed(self):
     """primed=True, standstill=True, brakePressed=True → hold activates (seamless hold, foot still on pedal)."""
@@ -264,23 +268,23 @@ class TestBrakeHoldController:
     assert self._get_brake_value(mock_bh) == CarControllerParams.BRAKE_HOLD_PRESSURE
 
   def test_holding_blocked_if_gas_pressed(self):
-    """primed=True, standstill=True, gasPressed=True → brake_value=0."""
+    """primed=True, standstill=True, gasPressed=True → no create_es_brake_hold call."""
     ctrl = make_ctrl()
     ctrl.frame = 0
     ctrl._brake_hold_primed = True
     mock_bh = run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
                          CS=make_CS(standstill=True, brakePressed=False, gasPressed=True))
-    assert self._get_brake_value(mock_bh) == 0
+    assert not mock_bh.called
 
   def test_holding_blocked_in_park(self):
-    """primed=True, standstill=True, gear=park → brake_value=0."""
+    """primed=True, standstill=True, gear=park → no create_es_brake_hold call."""
     ctrl = make_ctrl()
     ctrl.frame = 0
     ctrl._brake_hold_primed = True
     mock_bh = run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
                          CS=make_CS(standstill=True, brakePressed=False,
                                     gasPressed=False, gear=GearShifter.park))
-    assert self._get_brake_value(mock_bh) == 0
+    assert not mock_bh.called
 
   def test_holding_succeeds(self):
     """All hold conditions met → brake_value == BRAKE_HOLD_PRESSURE (non-zero)."""
@@ -477,3 +481,148 @@ class TestBrakeHoldController:
     """CarControllerParams.BRAKE_HOLD_PRESSURE must be a positive integer."""
     assert isinstance(CarControllerParams.BRAKE_HOLD_PRESSURE, int)
     assert CarControllerParams.BRAKE_HOLD_PRESSURE > 0
+
+
+# ---------------------------------------------------------------------------
+# TestACCInterferenceRegression
+#
+# Regression coverage for the accFaulted bug observed in route
+# dde08cad3a74cd94/0000004d--8360486eb1 seg 3 (2026-05-11): the brake-hold
+# carcontroller was unconditionally injecting ES_Brake=0 on bus 0 and
+# Brake_Status mask on cam bus while Eyesight ACC was actively braking from
+# rolling speed. This overrode Eyesight's brake command and hid the braking
+# module's feedback, triggering Eyesight's ~566ms Cruise_Fault watchdog.
+#
+# Fix invariant: when we are NOT actively holding AND NOT echoing AEB, the
+# carcontroller must transmit NEITHER 0x220 (create_es_brake_hold) NOR 0x13C
+# (create_brake_status_hold) — let Eyesight's own ES_Brake reach the braking
+# module and the module's Brake_Status reach Eyesight.
+# ---------------------------------------------------------------------------
+
+class TestACCInterferenceRegression:
+
+  def test_brake_hold_active_false_on_init(self):
+    """`_brake_hold_active` flag must exist and be False after construction."""
+    ctrl = make_ctrl()
+    assert hasattr(ctrl, "_brake_hold_active")
+    assert ctrl._brake_hold_active is False
+
+  def test_no_es_brake_hold_when_acc_braking_not_holding(self):
+    """ACC actively braking from rolling speed, not holding → no create_es_brake_hold call.
+
+    Reproduces the failing scenario: longActive=False (Eyesight ACC), BRAKE_HOLD flag set,
+    standstill=False, AEB_Status=0, Brake_Pressure>0 (Eyesight is requesting braking).
+    Old behavior overrode this with brake_value=0; new behavior must stay out of the way.
+    """
+    ctrl = make_ctrl(long_control=False)
+    ctrl.frame = 0
+    ctrl._brake_hold_primed = False
+    acc_braking_msg = {
+      "AEB_Status": 0, "CHECKSUM": 0, "Signal1": 0, "Brake_Pressure": 40,
+      "Cruise_Brake_Lights": 1, "Cruise_Brake_Fault": 0, "Cruise_Brake_Active": 1,
+      "Cruise_Activated": 1, "Signal3": 0,
+    }
+    CC = make_CC(enabled=True, long_active=False)
+    mock_bh, mock_bsh = run_update_capture_both(
+      ctrl, CC=CC, CC_SP=make_CC_SP(mads_enabled=True),
+      CS=make_CS(vEgoRaw=2.32, standstill=False, brakePressed=False,
+                 gasPressed=False, es_brake_msg=acc_braking_msg),
+    )
+    assert not mock_bh.called, "create_es_brake_hold must not be called during ACC braking when not holding"
+    assert not mock_bsh.called, "create_brake_status_hold must not be called during ACC braking when not holding"
+
+  def test_no_brake_status_mask_when_not_holding(self):
+    """Idle (not holding, not AEB): create_brake_status_hold must NOT be called.
+
+    The mask is only valid while we are actively asserting brake hold; otherwise
+    Eyesight must see the real Brake_Status (ES_Brake feedback) via Panda relay.
+    """
+    ctrl = make_ctrl()
+    ctrl.frame = 0  # frame%2 == 0 — would otherwise trigger the mask send
+    ctrl._brake_hold_primed = False
+    mock_bh, mock_bsh = run_update_capture_both(
+      ctrl, CC_SP=make_CC_SP(mads_enabled=True),
+      CS=make_CS(standstill=False, brakePressed=False, gasPressed=False, vEgoRaw=5.0),
+    )
+    assert not mock_bh.called
+    assert not mock_bsh.called
+
+  def test_holding_path_unchanged_regression(self):
+    """When actively holding, both 0x220 (with BRAKE_HOLD_PRESSURE) and 0x13C mask must still be sent."""
+    ctrl = make_ctrl()
+    ctrl.frame = 0  # frame%5==0 and frame%2==0
+    ctrl._brake_hold_primed = True
+    mock_bh, mock_bsh = run_update_capture_both(
+      ctrl, CC_SP=make_CC_SP(mads_enabled=True),
+      CS=make_CS(standstill=True, brakePressed=False, gasPressed=False),
+    )
+    assert mock_bh.called
+    # Fourth positional arg is brake_value
+    assert mock_bh.call_args[0][3] == CarControllerParams.BRAKE_HOLD_PRESSURE
+    assert mock_bsh.called
+
+  def test_aeb_passthrough_keeps_both_messages(self):
+    """AEB active (non-zero AEB_Status), not standstill → echo Brake_Pressure AND send mask.
+
+    AEB counts as active intercept: we DO want our ES_Brake echo to reach the
+    braking module to preserve full AEB authority, and we DO want the mask to
+    keep Eyesight from seeing redundant ES_Brake feedback during AEB.
+    """
+    ctrl = make_ctrl()
+    ctrl.frame = 0
+    ctrl._brake_hold_primed = False
+    aeb_msg = {
+      "AEB_Status": 4, "CHECKSUM": 0, "Signal1": 0, "Brake_Pressure": 600,
+      "Cruise_Brake_Lights": 1, "Cruise_Brake_Fault": 0, "Cruise_Brake_Active": 1,
+      "Cruise_Activated": 0, "Signal3": 0,
+    }
+    mock_bh, mock_bsh = run_update_capture_both(
+      ctrl, CC_SP=make_CC_SP(mads_enabled=True),
+      CS=make_CS(standstill=False, vEgoRaw=8.0, brakePressed=False,
+                 gasPressed=False, es_brake_msg=aeb_msg),
+    )
+    assert mock_bh.called
+    assert mock_bh.call_args[0][3] == 600
+    assert mock_bsh.called, "AEB must keep the Brake_Status mask active"
+
+  def test_brake_hold_active_tracks_state(self):
+    """`_brake_hold_active` flag must be True iff (holding or AEB)."""
+    ctrl = make_ctrl()
+    ctrl.frame = 0
+
+    # Case 1: idle ACC braking (regression scenario) → False
+    ctrl._brake_hold_primed = False
+    acc_msg = {"AEB_Status": 0, "CHECKSUM": 0, "Signal1": 0, "Brake_Pressure": 40,
+               "Cruise_Brake_Lights": 1, "Cruise_Brake_Fault": 0, "Cruise_Brake_Active": 1,
+               "Cruise_Activated": 1, "Signal3": 0}
+    run_update_capture_both(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
+                            CS=make_CS(standstill=False, vEgoRaw=2.3, es_brake_msg=acc_msg))
+    assert ctrl._brake_hold_active is False
+
+    # Case 2: holding → True
+    ctrl._brake_hold_primed = True
+    ctrl.frame = 0
+    run_update_capture_both(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
+                            CS=make_CS(standstill=True, brakePressed=False, gasPressed=False))
+    assert ctrl._brake_hold_active is True
+
+    # Case 3: AEB → True
+    ctrl._brake_hold_primed = False
+    ctrl.frame = 0
+    aeb_msg = {"AEB_Status": 4, "CHECKSUM": 0, "Signal1": 0, "Brake_Pressure": 600,
+               "Cruise_Brake_Lights": 1, "Cruise_Brake_Fault": 0, "Cruise_Brake_Active": 1,
+               "Cruise_Activated": 0, "Signal3": 0}
+    run_update_capture_both(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
+                            CS=make_CS(standstill=False, vEgoRaw=8.0, es_brake_msg=aeb_msg))
+    assert ctrl._brake_hold_active is True
+
+  def test_brake_status_msg_none_guard(self):
+    """CS.brake_status_msg=None → create_brake_status_hold must not be called even while holding."""
+    ctrl = make_ctrl()
+    ctrl.frame = 0
+    ctrl._brake_hold_primed = True
+    CS = make_CS(standstill=True, brakePressed=False, gasPressed=False)
+    CS.brake_status_msg = None
+    mock_bh, mock_bsh = run_update_capture_both(ctrl, CC_SP=make_CC_SP(mads_enabled=True), CS=CS)
+    assert mock_bh.called  # ES_Brake hold still goes out
+    assert not mock_bsh.called  # mask gated on brake_status_msg presence
