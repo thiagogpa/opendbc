@@ -402,20 +402,19 @@ class TestBrakeHoldController:
     assert not mock_bh.called
 
   # -----------------------------------------------------------------------
-  # 19. Guard: openpilotLongitudinalControl=True → no call
+  # 19. Guard: CC.longActive=True → no call (new contract)
   # -----------------------------------------------------------------------
 
-  def test_not_in_long_branch(self):
-    """openpilotLongitudinalControl=True puts update in a different branch.
+  def test_yields_when_long_active(self):
+    """CC.longActive=True puts ES_Brake under op long's control.
 
-    The brake hold code lives inside `else` (longControl=False).
-    When longControl=True, create_es_brake_hold must NOT be called.
+    Whether alpha long is *enabled* (CP.openpilotLongitudinalControl) does NOT
+    matter — only whether op long is *actively braking* (CC.longActive). This
+    is the new contract after AVH/alpha-long decoupling.
     """
     ctrl = make_ctrl(long_control=True, brake_hold=True)
     ctrl.frame = 0
     ctrl._brake_hold_primed = True
-    # When longControl=True, subarucan.create_es_brake and create_es_status are
-    # called instead. Patch those to avoid KeyErrors on mock CS.
     with patch("opendbc.car.subaru.subarucan.create_steering_control", return_value=_DUMMY_MSG), \
          patch("opendbc.car.subaru.subarucan.create_es_dashstatus", return_value=_DUMMY_MSG), \
          patch("opendbc.car.subaru.subarucan.create_es_lkas_state", return_value=_DUMMY_MSG), \
@@ -423,7 +422,7 @@ class TestBrakeHoldController:
          patch("opendbc.car.subaru.subarucan.create_es_brake", return_value=_DUMMY_MSG), \
          patch("opendbc.car.subaru.subarucan.create_es_distance", return_value=_DUMMY_MSG), \
          patch(_BRAKE_HOLD_PATCH, return_value=_DUMMY_MSG) as mock_bh:
-      ctrl.update(make_CC(), make_CC_SP(), make_CS(), 0)
+      ctrl.update(make_CC(enabled=True, long_active=True), make_CC_SP(), make_CS(), 0)
     assert not mock_bh.called
 
   # -----------------------------------------------------------------------

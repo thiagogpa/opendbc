@@ -167,15 +167,25 @@ class CarController(CarControllerBase, SnGCarController):
         if self.CP.flags & SubaruFlags.SEND_INFOTAINMENT:
           can_sends.append(subarucan.create_es_infotainment(self.packer, self.frame // 10, CS.es_infotainment_msg, hud_control.visualAlert))
 
+      # Brake-hold state machine runs whenever flag is set; returns brake_value to inject (or None).
+      brake_hold_value, brake_hold_active = self._update_brake_hold_state(CC, CC_SP, CS)
+      avh_owns_es_brake = brake_hold_value is not None and not CC.longActive
+
       if self.CP.openpilotLongitudinalControl:
         if self.frame % 5 == 0:
           can_sends.append(
             subarucan.create_es_status(self.packer, self.frame // 5, CS.es_status_msg, self.CP.openpilotLongitudinalControl, CC.longActive, cruise_rpm)
           )
 
-          can_sends.append(
-            subarucan.create_es_brake(self.packer, self.frame // 5, CS.es_brake_msg, self.CP.openpilotLongitudinalControl, CC.longActive, cruise_brake)
-          )
+          # ES_Brake arbitration: AVH wins when op long is not actively braking.
+          if avh_owns_es_brake:
+            can_sends.append(
+              subarucan.create_es_brake_hold(self.packer, self.frame // 5, CS.es_brake_msg, brake_hold_value)
+            )
+          else:
+            can_sends.append(
+              subarucan.create_es_brake(self.packer, self.frame // 5, CS.es_brake_msg, self.CP.openpilotLongitudinalControl, CC.longActive, cruise_brake)
+            )
 
           can_sends.append(
             subarucan.create_es_distance(
@@ -188,18 +198,17 @@ class CarController(CarControllerBase, SnGCarController):
             bus = CanBus.alt if self.CP.flags & SubaruFlags.GLOBAL_GEN2 else CanBus.main
             can_sends.append(subarucan.create_es_distance(self.packer, CS.es_distance_msg["COUNTER"] + 1, CS.es_distance_msg, bus, pcm_cancel_cmd))
 
-        # BRAKE HOLD — only reachable when openpilotLongitudinalControl=False (preserved here pending Task 3)
-        brake_value, _ = self._update_brake_hold_state(CC, CC_SP, CS)
-        if brake_value is not None and self.frame % 5 == 0:
+        if avh_owns_es_brake and self.frame % 5 == 0:
           can_sends.append(subarucan.create_es_brake_hold(
-            self.packer, self.frame // 5, CS.es_brake_msg,
-            brake_value
+            self.packer, self.frame // 5, CS.es_brake_msg, brake_hold_value
           ))
 
-        # Brake_Status mask
-        if (self.CP.flags & SubaruFlags.BRAKE_HOLD and self.frame % 2 == 0
-            and CS.brake_status_msg is not None and self._brake_hold_active):
-          can_sends.append(subarucan_ext.create_brake_status_hold(self.packer, CS.brake_status_msg))
+      # Brake_Status mask follows AVH state. When op long is actively braking,
+      # _brake_hold_active may still be True (the helper is pure of long-control flags),
+      # so we explicitly gate on `not CC.longActive` to hand the mask off to op long.
+      if (self.CP.flags & SubaruFlags.BRAKE_HOLD and self.frame % 2 == 0
+          and CS.brake_status_msg is not None and brake_hold_active and not CC.longActive):
+        can_sends.append(subarucan_ext.create_brake_status_hold(self.packer, CS.brake_status_msg))
 
       if self.CP.flags & SubaruFlags.DISABLE_EYESIGHT:
         # Tester present (keeps eyesight disabled)
