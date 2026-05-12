@@ -626,3 +626,99 @@ class TestACCInterferenceRegression:
     mock_bh, mock_bsh = run_update_capture_both(ctrl, CC_SP=make_CC_SP(mads_enabled=True), CS=CS)
     assert mock_bh.called  # ES_Brake hold still goes out
     assert not mock_bsh.called  # mask gated on brake_status_msg presence
+
+
+# ---------------------------------------------------------------------------
+# TestAlphaLongCoexistence
+#
+# After Task 3 the brake-hold injection must work whenever:
+#   CP.openpilotLongitudinalControl=True AND CC.longActive=False
+# And must yield (no create_es_brake_hold call; create_es_brake instead) when:
+#   CP.openpilotLongitudinalControl=True AND CC.longActive=True
+# ---------------------------------------------------------------------------
+
+_ES_BRAKE_PATCH = "opendbc.car.subaru.subarucan.create_es_brake"
+_ES_STATUS_PATCH = "opendbc.car.subaru.subarucan.create_es_status"
+_ES_DISTANCE_PATCH = "opendbc.car.subaru.subarucan.create_es_distance"
+
+
+def _run_long_branch(ctrl, CC, CC_SP=None, CS=None):
+  """Run ctrl.update() with all op-long-branch send fns patched.
+
+  Returns (mock_es_brake, mock_es_brake_hold, mock_brake_status_hold).
+  """
+  CC_SP = CC_SP or make_CC_SP()
+  CS = CS or make_CS()
+  with _STEERING_PATCH, _DASHSTATUS_PATCH, _LKAS_STATE_PATCH, \
+       patch(_ES_STATUS_PATCH, return_value=_DUMMY_MSG), \
+       patch(_ES_DISTANCE_PATCH, return_value=_DUMMY_MSG), \
+       patch(_ES_BRAKE_PATCH, return_value=_DUMMY_MSG) as mock_eb, \
+       patch(_BRAKE_HOLD_PATCH, return_value=_DUMMY_MSG) as mock_bh, \
+       patch(_BRAKE_STATUS_HOLD_PATCH, return_value=_DUMMY_BS_MSG) as mock_bsh:
+    ctrl.update(CC, CC_SP, CS, 0)
+  return mock_eb, mock_bh, mock_bsh
+
+
+class TestAlphaLongCoexistence:
+
+  def test_avh_fires_when_alpha_long_enabled_but_not_active(self):
+    """openpilotLongitudinalControl=True, CC.longActive=False, holding conditions met
+    → create_es_brake_hold MUST be called (AVH takes over ES_Brake)."""
+    ctrl = make_ctrl(long_control=True, brake_hold=True)
+    ctrl.frame = 0
+    ctrl._brake_hold_primed = True
+    CC = make_CC(enabled=False, long_active=False)
+    mock_eb, mock_bh, _ = _run_long_branch(
+      ctrl, CC,
+      CC_SP=make_CC_SP(mads_enabled=True),
+      CS=make_CS(standstill=True, brakePressed=False, gasPressed=False),
+    )
+    assert mock_bh.called, "create_es_brake_hold must run when alpha long enabled but inactive"
+    assert not mock_eb.called, "create_es_brake must NOT run when AVH is asserting ES_Brake"
+    # Hold pressure passed through.
+    assert mock_bh.call_args[0][3] == CarControllerParams.BRAKE_HOLD_PRESSURE
+
+  def test_avh_yields_when_alpha_long_active(self):
+    """openpilotLongitudinalControl=True, CC.longActive=True
+    → create_es_brake_hold MUST NOT be called; create_es_brake runs instead."""
+    ctrl = make_ctrl(long_control=True, brake_hold=True)
+    ctrl.frame = 0
+    ctrl._brake_hold_primed = True
+    CC = make_CC(enabled=True, long_active=True)
+    mock_eb, mock_bh, _ = _run_long_branch(
+      ctrl, CC,
+      CC_SP=make_CC_SP(mads_enabled=True),
+      CS=make_CS(standstill=True, brakePressed=False, gasPressed=False),
+    )
+    assert not mock_bh.called, "create_es_brake_hold must yield to op long when long_active=True"
+    assert mock_eb.called, "create_es_brake must run when long is actively in control"
+
+  def test_brake_status_mask_under_alpha_long_when_avh_active(self):
+    """openpilotLongitudinalControl=True, AVH actively holding → Brake_Status mask must apply.
+
+    Mask runs at frame % 2 == 0 and is independent of the long-control branch.
+    """
+    ctrl = make_ctrl(long_control=True, brake_hold=True)
+    ctrl.frame = 0
+    ctrl._brake_hold_primed = True
+    CC = make_CC(enabled=False, long_active=False)
+    _, _, mock_bsh = _run_long_branch(
+      ctrl, CC,
+      CC_SP=make_CC_SP(mads_enabled=True),
+      CS=make_CS(standstill=True, brakePressed=False, gasPressed=False),
+    )
+    assert mock_bsh.called, "Brake_Status mask must run when AVH active under alpha long"
+
+  def test_brake_status_mask_yields_under_alpha_long_active(self):
+    """openpilotLongitudinalControl=True, CC.longActive=True → no Brake_Status mask
+    (op long owns the brake message exchange)."""
+    ctrl = make_ctrl(long_control=True, brake_hold=True)
+    ctrl.frame = 0
+    ctrl._brake_hold_primed = True
+    CC = make_CC(enabled=True, long_active=True)
+    _, _, mock_bsh = _run_long_branch(
+      ctrl, CC,
+      CC_SP=make_CC_SP(mads_enabled=True),
+      CS=make_CS(standstill=True, brakePressed=False, gasPressed=False),
+    )
+    assert not mock_bsh.called, "Brake_Status mask must not run when long is active"
