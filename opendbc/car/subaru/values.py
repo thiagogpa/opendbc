@@ -51,7 +51,7 @@ class CarControllerParams:
   BRAKE_LOOKUP_BP = [-3.5, 0]
   BRAKE_LOOKUP_V = [BRAKE_MAX, BRAKE_MIN]
 
-  BRAKE_HOLD_PRESSURE = 400  # validated: 100 insufficient on incline; 400 ≈ 65% authority
+  BRAKE_HOLD_PRESSURE = 600  # max pressure; ensures hold on slopes
 
 
 class SubaruSafetyFlags(IntFlag):
