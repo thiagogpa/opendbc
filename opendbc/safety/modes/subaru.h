@@ -206,15 +206,32 @@ static bool subaru_tx_hook(const CANPacket_t *msg) {
   if (msg->addr == MSG_SUBARU_ES_Brake) {
     int es_brake_pressure = GET_BYTES(msg, 2, 2);
 
-    if (subaru_brake_intercept && !subaru_longitudinal) {
-      // brake_intercept path: non-zero pressure only allowed at standstill.
-      // RACE-A: allow for BRAKE_INTERCEPT_RELEASE_FRAMES after vehicle_moving=true to cover
-      // the ~10ms Python control loop lag at 50Hz Wheel_Speeds (1 frame = 20ms).
-      // rx_hook counts UP (0 → BRAKE_INTERCEPT_RELEASE_FRAMES); settling while countdown < limit.
+    if (subaru_brake_intercept) {
+      // Union check: ES_Brake accepted if EITHER the AVH-valid set OR the
+      // standard longitudinal-valid set permits it.
+      //
+      // AVH path (active regardless of subaru_longitudinal):
+      //   - pressure ≤ max_brake
+      //   - controls_allowed OR controls_allowed_lateral (MADS active is sufficient)
+      //   - standstill OR within RACE-A settling window (BRAKE_INTERCEPT_RELEASE_FRAMES)
+      //
+      // Longitudinal path (only meaningful when subaru_longitudinal is set):
+      //   - get_longitudinal_allowed() (controls_allowed && !gas_pressed_prev)
+      //   - pressure ≤ max_brake
+      //
+      // Either path passing → no violation. Both failing → violation.
       bool standstill_or_settling = !vehicle_moving || (brake_intercept_release_countdown < BRAKE_INTERCEPT_RELEASE_FRAMES);
-      violation |= (es_brake_pressure > SUBARU_LONG_LIMITS.max_brake);
-      violation |= (!controls_allowed && !controls_allowed_lateral) && (es_brake_pressure != 0);
-      violation |= !standstill_or_settling && (es_brake_pressure != 0);
+
+      bool avh_pressure_invalid = (es_brake_pressure > SUBARU_LONG_LIMITS.max_brake);
+      bool avh_no_authority     = (!controls_allowed && !controls_allowed_lateral) && (es_brake_pressure != 0);
+      bool avh_not_standstill   = !standstill_or_settling && (es_brake_pressure != 0);
+      bool avh_valid = !(avh_pressure_invalid || avh_no_authority || avh_not_standstill);
+
+      // long_valid only applies when alpha-long is on; in non-long brake_intercept mode
+      // subaru_longitudinal=false so longitudinal_brake_checks is irrelevant.
+      bool long_valid = subaru_longitudinal && !longitudinal_brake_checks(es_brake_pressure, SUBARU_LONG_LIMITS);
+
+      violation |= !(avh_valid || long_valid);
 
       // ACC-fault fix: any non-zero ES_Brake TX is a hold injection. Bump the
       // active-hold countdown so fwd_hook blocks Eyesight's competing ES_Brake
