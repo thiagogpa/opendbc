@@ -714,5 +714,66 @@ class TestSubaruLongBrakeIntercept(TestSubaruBrakeIntercept):
     self.assertFalse(self._tx(self._brake_status_msg(0)))
 
 
+class TestSubaruLongSnGBrakeIntercept(TestSubaruLongBrakeIntercept):
+  """
+  Gen1, alpha long enabled, SnG + brake_intercept SP params, AVH.
+  This is the on-device configuration for SUBARU_IMPREZA_2020 with both
+  StopAndGo and alpha long enabled.
+  """
+
+  TX_MSGS = (
+    lkas_tx_msgs(SUBARU_MAIN_BUS)
+    + [[SubaruMsg.ES_Brake,        SUBARU_MAIN_BUS]]
+    + [[SubaruMsg.ES_Status,       SUBARU_MAIN_BUS]]
+    + [[SubaruMsg.Throttle,        SUBARU_CAM_BUS]]
+    + [[MSG_SUBARU_Brake_Pedal,    SUBARU_CAM_BUS]]
+    + [[MSG_SUBARU_Brake_Status,   SUBARU_CAM_BUS]]
+  )
+
+  RELAY_MALFUNCTION_ADDRS = {
+    SUBARU_MAIN_BUS: (
+      SubaruMsg.ES_LKAS, SubaruMsg.ES_DashStatus, SubaruMsg.ES_LKAS_State,
+      SubaruMsg.ES_Infotainment, SubaruMsg.ES_Brake, SubaruMsg.ES_Status,
+    ),
+    SUBARU_CAM_BUS: (
+      SubaruMsg.Throttle, MSG_SUBARU_Brake_Pedal, MSG_SUBARU_Brake_Status,
+    ),
+  }
+
+  FWD_BLACKLISTED_ADDRS = {
+    SUBARU_CAM_BUS: [
+      SubaruMsg.ES_LKAS, SubaruMsg.ES_DashStatus, SubaruMsg.ES_LKAS_State,
+      SubaruMsg.ES_Infotainment,
+    ],
+    SUBARU_MAIN_BUS: [
+      SubaruMsg.Throttle, MSG_SUBARU_Brake_Pedal,
+    ],
+  }
+
+  def setUp(self):
+    self.packer = CANPackerSafety("subaru_global_2017_generated")
+    self.safety = libsafety_py.libsafety
+    self.safety.set_current_safety_param_sp(
+      SubaruSafetyFlagsSP.STOP_AND_GO | SubaruSafetyFlagsSP.BRAKE_INTERCEPT
+    )
+    self.safety.set_safety_hooks(CarParams.SafetyModel.subaru, self.FLAGS)
+    self.safety.init_tests()
+
+  def test_long_sng_intercept_includes_throttle_cam(self):
+    self.assertIn([SubaruMsg.Throttle, SUBARU_CAM_BUS], self.TX_MSGS)
+
+  def test_long_sng_intercept_includes_brake_pedal_cam(self):
+    self.assertIn([MSG_SUBARU_Brake_Pedal, SUBARU_CAM_BUS], self.TX_MSGS)
+
+  def test_gen2_long_with_brake_intercept_uses_gen2_long_path(self):
+    self.safety.set_current_safety_param_sp(
+      SubaruSafetyFlagsSP.STOP_AND_GO | SubaruSafetyFlagsSP.BRAKE_INTERCEPT
+    )
+    self.safety.set_safety_hooks(CarParams.SafetyModel.subaru,
+                                  SubaruSafetyFlags.LONG | SubaruSafetyFlags.GEN2)
+    self.safety.init_tests()
+    self.assertFalse(self._tx(self._brake_status_msg(0)))
+
+
 if __name__ == "__main__":
   unittest.main()
