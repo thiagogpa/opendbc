@@ -337,6 +337,26 @@ static safety_config subaru_init(uint16_t param) {
     {MSG_SUBARU_Brake_Status, SUBARU_CAM_BUS,  8, .check_relay = true, .disable_static_blocking = true},
   };
 
+  // alpha long + brake_intercept (no SnG): long msgs + Brake_Pedal (cam, SnG-resume compat)
+  // + Brake_Status (cam, conditional fwd). ES_Brake is included via SUBARU_COMMON_LONG_TX_MSGS
+  // with check_relay=true but no disable_static_blocking — op long owns the cam→main ES_Brake
+  // relay; Eyesight's ES_Brake stays statically blocked while long is active.
+  // Brake_Status uses disable_static_blocking=true so subaru_fwd_hook controls the block.
+  static const CanMsg subaru_long_brake_intercept_tx_msgs[] = {
+    SUBARU_BASE_TX_MSGS(SUBARU_MAIN_BUS, MSG_SUBARU_ES_LKAS)
+    SUBARU_COMMON_LONG_TX_MSGS(SUBARU_MAIN_BUS)
+    {MSG_SUBARU_Brake_Pedal,  SUBARU_CAM_BUS, 8, .check_relay = true},
+    {MSG_SUBARU_Brake_Status, SUBARU_CAM_BUS, 8, .check_relay = true, .disable_static_blocking = true},
+  };
+
+  // alpha long + SnG + brake_intercept: same as above plus Throttle (cam).
+  static const CanMsg subaru_long_sng_brake_intercept_tx_msgs[] = {
+    SUBARU_BASE_TX_MSGS(SUBARU_MAIN_BUS, MSG_SUBARU_ES_LKAS)
+    SUBARU_COMMON_LONG_TX_MSGS(SUBARU_MAIN_BUS)
+    SUBARU_STOP_AND_GO_TX_MSGS
+    {MSG_SUBARU_Brake_Status, SUBARU_CAM_BUS, 8, .check_relay = true, .disable_static_blocking = true},
+  };
+
   static RxCheck subaru_rx_checks[] = {
     SUBARU_COMMON_RX_CHECKS(SUBARU_MAIN_BUS)
   };
@@ -365,7 +385,13 @@ static safety_config subaru_init(uint16_t param) {
                                 BUILD_SAFETY_CFG(subaru_gen2_rx_checks, SUBARU_GEN2_TX_MSGS);
   } else {
     if (subaru_longitudinal) {
-      ret = BUILD_SAFETY_CFG(subaru_rx_checks, SUBARU_LONG_TX_MSGS);
+      if (subaru_stop_and_go && subaru_brake_intercept) {
+        ret = BUILD_SAFETY_CFG(subaru_rx_checks, subaru_long_sng_brake_intercept_tx_msgs);
+      } else if (subaru_brake_intercept) {
+        ret = BUILD_SAFETY_CFG(subaru_rx_checks, subaru_long_brake_intercept_tx_msgs);
+      } else {
+        ret = BUILD_SAFETY_CFG(subaru_rx_checks, SUBARU_LONG_TX_MSGS);
+      }
     } else if (subaru_stop_and_go && subaru_brake_intercept) {
       ret = BUILD_SAFETY_CFG(subaru_rx_checks, subaru_sng_brake_intercept_tx_msgs);
     } else if (subaru_stop_and_go) {

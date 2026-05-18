@@ -590,25 +590,26 @@ class TestSubaruLongBrakeIntercept(TestSubaruBrakeIntercept):
     + [[MSG_SUBARU_Brake_Pedal,    SUBARU_CAM_BUS]]
   )
 
-  # ES_Brake relay malfunction: TX bus = MAIN → fires when seen on MAIN.
-  # Brake_Status relay malfunction: TX bus = CAM → fires when seen on CAM.
+  # MAIN bus relay addrs: long mode adds ES_Distance + ES_Status (check_relay=true in
+  # SUBARU_COMMON_LONG_TX_MSGS). CAM bus adds Brake_Pedal (standalone entry with check_relay=true)
+  # and Brake_Status.
   RELAY_MALFUNCTION_ADDRS = {
     SUBARU_MAIN_BUS: (
       SubaruMsg.ES_LKAS, SubaruMsg.ES_DashStatus, SubaruMsg.ES_LKAS_State,
-      SubaruMsg.ES_Infotainment, SubaruMsg.ES_Brake, SubaruMsg.ES_Status,
+      SubaruMsg.ES_Infotainment, SubaruMsg.ES_Brake, SubaruMsg.ES_Distance, SubaruMsg.ES_Status,
     ),
     SUBARU_CAM_BUS: (
-      MSG_SUBARU_Brake_Status,
+      MSG_SUBARU_Brake_Pedal, MSG_SUBARU_Brake_Status,
     ),
   }
 
-  # ES_Brake and Brake_Status: conditional fwd_hook block — covered by inherited fwd tests
-  # in the parent class TestSubaruBrakeIntercept. Static fwd blacklist covers only the
-  # always-blocked LKAS family and the Brake_Pedal (TX bus=CAM → block arriving from MAIN).
+  # In long mode, ES_Brake + ES_Distance + ES_Status cam→main are ALL statically blocked
+  # (SUBARU_COMMON_LONG_TX_MSGS uses check_relay=true for all three, no disable_static_blocking).
+  # Op long is the sole sender of these on main bus. Brake_Pedal (TX bus=CAM → block MAIN→CAM).
   FWD_BLACKLISTED_ADDRS = {
     SUBARU_CAM_BUS: [
       SubaruMsg.ES_LKAS, SubaruMsg.ES_DashStatus, SubaruMsg.ES_LKAS_State,
-      SubaruMsg.ES_Infotainment,
+      SubaruMsg.ES_Infotainment, SubaruMsg.ES_Brake, SubaruMsg.ES_Distance, SubaruMsg.ES_Status,
     ],
     SUBARU_MAIN_BUS: [
       MSG_SUBARU_Brake_Pedal,
@@ -713,6 +714,101 @@ class TestSubaruLongBrakeIntercept(TestSubaruBrakeIntercept):
     # Brake_Status must NOT be in gen2 long allowlist.
     self.assertFalse(self._tx(self._brake_status_msg(0)))
 
+  # ── Moving-while-MADS overrides: parent uses controls_allowed=True which, in long mode,
+  # triggers the longitudinal path (allowed while rolling). Override to MADS-only
+  # (controls_allowed=False, controls_allowed_lateral=True) to properly test the AVH invariant.
+
+  def test_es_brake_nonzero_blocked_when_moving(self):
+    """MADS-only: once rolling past settling window, AVH must not inject brake."""
+    self._set_standstill()
+    self.safety.set_controls_allowed(False)
+    self.safety.set_controls_allowed_lateral(True)
+    self._exhaust_hysteresis()
+    self.assertFalse(self._tx(self._es_brake_msg(100)))
+
+  def test_es_brake_nonzero_blocked_when_moving_various_pressures(self):
+    """MADS-only: several pressures all blocked once fully moving past settling window."""
+    self._set_standstill()
+    self.safety.set_controls_allowed(False)
+    self.safety.set_controls_allowed_lateral(True)
+    self._exhaust_hysteresis()
+    for pressure in (1, 50, 100, 300, 600):
+      with self.subTest(pressure=pressure):
+        self.assertFalse(self._tx(self._es_brake_msg(pressure)))
+
+  def test_race_a_blocked_at_frame3(self):
+    """MADS-only: at BRAKE_INTERCEPT_RELEASE_FRAMES moving frames, not settling → blocked."""
+    self._set_standstill()
+    self.safety.set_controls_allowed(False)
+    self.safety.set_controls_allowed_lateral(True)
+    self._set_moving(frames=BRAKE_INTERCEPT_RELEASE_FRAMES)
+    self.assertFalse(self._tx(self._es_brake_msg(100)))
+
+  def test_race_a_blocked_after_hysteresis_frame4plus(self):
+    """MADS-only: 4+ frames past settling → blocked."""
+    self._set_standstill()
+    self.safety.set_controls_allowed(False)
+    self.safety.set_controls_allowed_lateral(True)
+    self._exhaust_hysteresis()
+    self.assertFalse(self._tx(self._es_brake_msg(100)))
+
+  def test_race_a_countdown_resets_on_standstill(self):
+    """MADS-only: returning to standstill after rolling re-allows non-zero pressure."""
+    self._set_standstill()
+    self.safety.set_controls_allowed(False)
+    self.safety.set_controls_allowed_lateral(True)
+    self._exhaust_hysteresis()
+    self.assertFalse(self._tx(self._es_brake_msg(100)))
+    self._set_standstill()
+    self.assertTrue(self._tx(self._es_brake_msg(100)))
+
+  # ── Fwd overrides: ES_Brake cam→main is ALWAYS statically blocked in long mode ─
+
+  def test_fwd_es_brake_cam_to_main_allowed_when_idle(self):
+    """In long mode, op long owns ES_Brake on main bus — cam→main always statically blocked."""
+    self.assertEqual(-1, self.safety.safety_fwd_hook(SUBARU_CAM_BUS, SubaruMsg.ES_Brake))
+
+  def test_fwd_restored_after_countdown_expires(self):
+    """After countdown: Brake_Status fwd restored; ES_Brake remains statically blocked."""
+    self._tx_hold_pressure()
+    self._pump_wheel_speeds(SUBARU_BRAKE_HOLD_ACTIVE_FRAMES)
+    self.assertEqual(-1, self.safety.safety_fwd_hook(SUBARU_CAM_BUS, SubaruMsg.ES_Brake))
+    self.assertEqual(SUBARU_CAM_BUS,
+                     self.safety.safety_fwd_hook(SUBARU_MAIN_BUS, MSG_SUBARU_Brake_Status))
+
+  def test_fwd_blocked_retriggered_by_subsequent_hold_tx(self):
+    """Re-trigger after countdown: Brake_Status re-blocked; ES_Brake always blocked."""
+    self._tx_hold_pressure()
+    self._pump_wheel_speeds(SUBARU_BRAKE_HOLD_ACTIVE_FRAMES)
+    self.assertEqual(-1, self.safety.safety_fwd_hook(SUBARU_CAM_BUS, SubaruMsg.ES_Brake))
+    self._set_standstill()
+    self.assertTrue(self._tx(self._es_brake_msg(400)))
+    self.assertEqual(-1, self.safety.safety_fwd_hook(SUBARU_CAM_BUS, SubaruMsg.ES_Brake))
+
+  def test_fwd_not_blocked_after_zero_pressure_tx(self):
+    """Zero-pressure TX: no hold countdown set; Brake_Status still forwarded; ES_Brake always -1."""
+    self.safety.set_controls_allowed(True)
+    self.assertTrue(self._tx(self._es_brake_msg(0)))
+    self.assertEqual(-1, self.safety.safety_fwd_hook(SUBARU_CAM_BUS, SubaruMsg.ES_Brake))
+    self.assertEqual(SUBARU_CAM_BUS,
+                     self.safety.safety_fwd_hook(SUBARU_MAIN_BUS, MSG_SUBARU_Brake_Status))
+
+  def test_fwd_remains_blocked_during_countdown(self):
+    """During countdown: Brake_Status blocked; ES_Brake also -1 (always, in long mode)."""
+    self._tx_hold_pressure()
+    for k in range(SUBARU_BRAKE_HOLD_ACTIVE_FRAMES - 1):
+      self._pump_wheel_speeds(1)
+      with self.subTest(after_pumps=k + 1):
+        self.assertEqual(-1, self.safety.safety_fwd_hook(SUBARU_CAM_BUS, SubaruMsg.ES_Brake))
+        self.assertEqual(-1, self.safety.safety_fwd_hook(SUBARU_MAIN_BUS, MSG_SUBARU_Brake_Status))
+
+  def test_fwd_es_brake_restored_for_aeb_after_hold_release(self):
+    """In long mode, ES_Brake cam→main is always blocked — op long handles AEB, not Eyesight relay."""
+    self._tx_hold_pressure()
+    self._pump_wheel_speeds(SUBARU_BRAKE_HOLD_ACTIVE_FRAMES)
+    self.assertEqual(-1, self.safety.safety_fwd_hook(SUBARU_CAM_BUS, SubaruMsg.ES_Brake),
+                     "ES_Brake cam→main must stay blocked in long mode even after hold release")
+
 
 class TestSubaruLongSnGBrakeIntercept(TestSubaruLongBrakeIntercept):
   """
@@ -733,7 +829,7 @@ class TestSubaruLongSnGBrakeIntercept(TestSubaruLongBrakeIntercept):
   RELAY_MALFUNCTION_ADDRS = {
     SUBARU_MAIN_BUS: (
       SubaruMsg.ES_LKAS, SubaruMsg.ES_DashStatus, SubaruMsg.ES_LKAS_State,
-      SubaruMsg.ES_Infotainment, SubaruMsg.ES_Brake, SubaruMsg.ES_Status,
+      SubaruMsg.ES_Infotainment, SubaruMsg.ES_Brake, SubaruMsg.ES_Distance, SubaruMsg.ES_Status,
     ),
     SUBARU_CAM_BUS: (
       SubaruMsg.Throttle, MSG_SUBARU_Brake_Pedal, MSG_SUBARU_Brake_Status,
@@ -743,7 +839,7 @@ class TestSubaruLongSnGBrakeIntercept(TestSubaruLongBrakeIntercept):
   FWD_BLACKLISTED_ADDRS = {
     SUBARU_CAM_BUS: [
       SubaruMsg.ES_LKAS, SubaruMsg.ES_DashStatus, SubaruMsg.ES_LKAS_State,
-      SubaruMsg.ES_Infotainment,
+      SubaruMsg.ES_Infotainment, SubaruMsg.ES_Brake, SubaruMsg.ES_Distance, SubaruMsg.ES_Status,
     ],
     SUBARU_MAIN_BUS: [
       SubaruMsg.Throttle, MSG_SUBARU_Brake_Pedal,
