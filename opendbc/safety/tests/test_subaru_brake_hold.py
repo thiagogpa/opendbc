@@ -809,6 +809,48 @@ class TestSubaruLongBrakeIntercept(TestSubaruBrakeIntercept):
     self.assertEqual(-1, self.safety.safety_fwd_hook(SUBARU_CAM_BUS, SubaruMsg.ES_Brake),
                      "ES_Brake cam→main must stay blocked in long mode even after hold release")
 
+  def test_long_path_brake_does_not_bump_countdown(self):
+    """Op-long braking via long_valid path must NOT bump the hold countdown.
+    Scenario 3a/3b: if countdown were bumped, Eyesight's Brake_Status relay would be
+    starved during sustained ACC braking, causing ACC faults."""
+    self.safety.set_controls_allowed(True)
+    self._set_moving(frames=BRAKE_INTERCEPT_RELEASE_FRAMES + 1)  # fully moving, past settling
+    # TX via long_valid path (ACC on, moving — avh_valid=False)
+    self.assertTrue(self._tx(self._es_brake_msg(300)),
+                    "op-long brake TX must be allowed via long_valid path")
+    # Countdown must NOT have been bumped — Brake_Status must still forward
+    self.assertEqual(SUBARU_CAM_BUS,
+                     self.safety.safety_fwd_hook(SUBARU_MAIN_BUS, MSG_SUBARU_Brake_Status),
+                     "Brake_Status MAIN→CAM must NOT be blocked after op-long brake TX (only AVH hold may block)")
+
+  def test_sustained_long_braking_does_not_starve_brake_status_relay(self):
+    """30 consecutive op-long brake TXes must not starve the Brake_Status fwd relay.
+    Without the fix, every TX refreshes the countdown indefinitely.
+    Must keep vehicle_moving=True throughout — uses non-zero speed RX to stay in long_valid path."""
+    self.safety.set_controls_allowed(True)
+    self._set_moving(frames=BRAKE_INTERCEPT_RELEASE_FRAMES + 1)
+    for _ in range(30):
+      self.assertTrue(self._tx(self._es_brake_msg(300)))
+      self._rx(self._speed_msg(10))  # non-zero: stay moving so avh_valid=False (long path only)
+    self.assertEqual(SUBARU_CAM_BUS,
+                     self.safety.safety_fwd_hook(SUBARU_MAIN_BUS, MSG_SUBARU_Brake_Status),
+                     "Brake_Status must still forward to cam after sustained op-long braking")
+
+  def test_safety_reinit_resets_countdown(self):
+    """Re-calling set_safety_hooks must clear the active-hold countdown immediately."""
+    self._tx_hold_pressure()
+    # Verify countdown is set
+    self.assertEqual(-1, self.safety.safety_fwd_hook(SUBARU_MAIN_BUS, MSG_SUBARU_Brake_Status),
+                     "countdown should be active after hold TX")
+    # Re-init safety
+    self.safety.set_current_safety_param_sp(SubaruSafetyFlagsSP.BRAKE_INTERCEPT)
+    self.safety.set_safety_hooks(CarParams.SafetyModel.subaru, self.FLAGS)
+    self.safety.init_tests()
+    # Countdown must be reset to 0 — fwd must be immediately open
+    self.assertEqual(SUBARU_CAM_BUS,
+                     self.safety.safety_fwd_hook(SUBARU_MAIN_BUS, MSG_SUBARU_Brake_Status),
+                     "Brake_Status fwd must be unblocked immediately after safety reinit")
+
 
 class TestSubaruLongSnGBrakeIntercept(TestSubaruLongBrakeIntercept):
   """

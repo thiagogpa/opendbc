@@ -233,10 +233,11 @@ static bool subaru_tx_hook(const CANPacket_t *msg) {
 
       violation |= !(avh_valid || long_valid);
 
-      // ACC-fault fix: any non-zero ES_Brake TX is a hold injection. Bump the
-      // active-hold countdown so fwd_hook blocks Eyesight's competing ES_Brake
-      // and the braking module's Brake_Status feedback.
-      if (!violation && (es_brake_pressure > 0)) {
+      // ACC-fault fix: only bump the active-hold countdown when AVH is asserting
+      // a hold (avh_valid path). Do NOT bump for op-long normal braking (long_valid
+      // path) — that would starve Eyesight's Brake_Status relay during ACC braking
+      // and briefly block Eyesight AEB when op-long disengages.
+      if (!violation && avh_valid && (es_brake_pressure > 0)) {
         subaru_brake_hold_active_countdown = SUBARU_BRAKE_HOLD_ACTIVE_FRAMES;
       }
     } else {
@@ -385,6 +386,7 @@ static safety_config subaru_init(uint16_t param) {
   const uint16_t SUBARU_PARAM_GEN2 = 1;
 
   subaru_gen2 = GET_FLAG(param, SUBARU_PARAM_GEN2);
+  subaru_longitudinal = false;  // reset before ALLOW_DEBUG may override; avoids stale value from prior init
 
   subaru_common_init();
 
