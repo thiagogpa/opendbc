@@ -563,5 +563,156 @@ class TestSubaruSnGBrakeIntercept(TestSubaruBrakeIntercept):
     self.assertFalse(self._tx(self._brake_status_msg(0)))
 
 
+class TestSubaruLongBrakeIntercept(TestSubaruBrakeIntercept):
+  """
+  Gen1, alpha long enabled, brake_intercept SP param set, no SnG.
+  This is the scenario that fails on real hardware (route dde08cad3a74cd94|00000012):
+  alpha long ON, MADS active, op long not engaged, AVH wants to hold at standstill.
+
+  Expected behavior:
+    - ES_Brake=600 at standstill+MADS must be ACCEPTED (currently rejected by
+      longitudinal_brake_checks because controls_allowed=False).
+    - Brake_Status mask must be in TX allowlist and accepted when subaru_brake_intercept set.
+    - When controls_allowed=True (ACC engaged), full-range ES_Brake (any pressure ≤ max_brake)
+      must still be accepted — the union with AVH-valid set must not narrow the long path.
+  """
+  FLAGS = SubaruSafetyFlags.LONG
+
+  # TX allowlist when subaru_longitudinal && subaru_brake_intercept (no SnG).
+  # Must include: base LKAS + long common (ES_Distance, ES_Brake, ES_Status)
+  # + Brake_Status (cam, conditional fwd via disable_static_blocking)
+  # + Brake_Pedal (cam, kept for SnG-resume compat even when SnG not selected — harmless).
+  TX_MSGS = (
+    lkas_tx_msgs(SUBARU_MAIN_BUS)
+    + [[SubaruMsg.ES_Brake,        SUBARU_MAIN_BUS]]
+    + [[SubaruMsg.ES_Status,       SUBARU_MAIN_BUS]]
+    + [[MSG_SUBARU_Brake_Status,   SUBARU_CAM_BUS]]
+    + [[MSG_SUBARU_Brake_Pedal,    SUBARU_CAM_BUS]]
+  )
+
+  # ES_Brake relay malfunction: TX bus = MAIN → fires when seen on MAIN.
+  # Brake_Status relay malfunction: TX bus = CAM → fires when seen on CAM.
+  RELAY_MALFUNCTION_ADDRS = {
+    SUBARU_MAIN_BUS: (
+      SubaruMsg.ES_LKAS, SubaruMsg.ES_DashStatus, SubaruMsg.ES_LKAS_State,
+      SubaruMsg.ES_Infotainment, SubaruMsg.ES_Brake, SubaruMsg.ES_Status,
+    ),
+    SUBARU_CAM_BUS: (
+      MSG_SUBARU_Brake_Status,
+    ),
+  }
+
+  # ES_Brake and Brake_Status: conditional fwd_hook block — covered by inherited fwd tests
+  # in the parent class TestSubaruBrakeIntercept. Static fwd blacklist covers only the
+  # always-blocked LKAS family and the Brake_Pedal (TX bus=CAM → block arriving from MAIN).
+  FWD_BLACKLISTED_ADDRS = {
+    SUBARU_CAM_BUS: [
+      SubaruMsg.ES_LKAS, SubaruMsg.ES_DashStatus, SubaruMsg.ES_LKAS_State,
+      SubaruMsg.ES_Infotainment,
+    ],
+    SUBARU_MAIN_BUS: [
+      MSG_SUBARU_Brake_Pedal,
+    ],
+  }
+
+  def setUp(self):
+    self.packer = CANPackerSafety("subaru_global_2017_generated")
+    self.safety = libsafety_py.libsafety
+    # CRITICAL: SP param set BEFORE set_safety_hooks (panda reads at init).
+    self.safety.set_current_safety_param_sp(SubaruSafetyFlagsSP.BRAKE_INTERCEPT)
+    self.safety.set_safety_hooks(CarParams.SafetyModel.subaru, self.FLAGS)
+    self.safety.init_tests()
+
+  # ── Allowlist sanity ─────────────────────────────────────────────────────────
+
+  def test_long_plus_intercept_includes_es_brake_main(self):
+    self.assertIn([SubaruMsg.ES_Brake, SUBARU_MAIN_BUS], self.TX_MSGS)
+
+  def test_long_plus_intercept_includes_brake_status_cam(self):
+    self.assertIn([MSG_SUBARU_Brake_Status, SUBARU_CAM_BUS], self.TX_MSGS)
+
+  def test_long_plus_intercept_includes_es_status_main(self):
+    self.assertIn([SubaruMsg.ES_Status, SUBARU_MAIN_BUS], self.TX_MSGS)
+
+  # ── Core regression: MADS-only AVH hold at standstill with alpha long ────────
+
+  def test_avh_hold_pressure_allowed_with_mads_at_standstill(self):
+    """
+    Reproduces the failing log scenario: alpha long enabled, op long NOT engaged,
+    MADS active (controls_allowed_lateral=True), standstill.
+    AVH must be allowed to inject ES_Brake=BRAKE_HOLD_PRESSURE (600).
+    """
+    self._set_standstill()
+    self.safety.set_controls_allowed(False)             # ACC off
+    self.safety.set_controls_allowed_lateral(True)      # MADS active
+    self.assertTrue(self._tx(self._es_brake_msg(600)),
+                    "AVH hold at standstill+MADS must be allowed when alpha long is on")
+
+  def test_avh_hold_pressure_blocked_when_moving_without_acc(self):
+    """
+    Safety invariant: with only MADS (no ACC), brake injection is allowed
+    ONLY at standstill (+ RACE-A settling window). Once truly rolling, AVH is blocked.
+    """
+    self._exhaust_hysteresis()                          # countdown maxed → no longer settling
+    self.safety.set_controls_allowed(False)
+    self.safety.set_controls_allowed_lateral(True)
+    self.assertFalse(self._tx(self._es_brake_msg(600)),
+                     "AVH must NOT inject brake while rolling without ACC engaged")
+
+  def test_long_path_unchanged_when_acc_engaged(self):
+    """
+    When ACC is engaged (controls_allowed=True), full ES_Brake range must work
+    EVEN AT NON-STANDSTILL — the long-path semantics (op-long deceleration from
+    rolling speed) must not be narrowed by adding the AVH union.
+    """
+    self._exhaust_hysteresis()                          # rolling, NOT in settling window
+    self.safety.set_controls_allowed(True)
+    self.safety.set_controls_allowed_lateral(True)
+    self.assertTrue(self._tx(self._es_brake_msg(100)),  # op long mid-brake
+                    "op-long must brake while rolling with ACC engaged")
+
+  def test_brake_pressure_above_max_rejected(self):
+    """Max brake limit (600) is enforced regardless of which path is permissive."""
+    self._set_standstill()
+    self.safety.set_controls_allowed(True)
+    self.safety.set_controls_allowed_lateral(True)
+    self.assertFalse(self._tx(self._es_brake_msg(601)))
+
+  def test_no_controls_no_lateral_blocks_nonzero_brake(self):
+    """Neither ACC nor MADS → any nonzero brake is rejected."""
+    self._set_standstill()
+    self.safety.set_controls_allowed(False)
+    self.safety.set_controls_allowed_lateral(False)
+    self.assertFalse(self._tx(self._es_brake_msg(100)))
+    self.assertTrue(self._tx(self._es_brake_msg(0)),
+                    "Zero brake is always allowed (inactive value)")
+
+  # ── Brake_Status mask coverage ───────────────────────────────────────────────
+
+  def test_brake_status_mask_allowed_with_brake_intercept(self):
+    """Brake_Status with ES_Brake_bit=0 must be allowed when subaru_brake_intercept set,
+    regardless of subaru_longitudinal state."""
+    self.assertTrue(self._tx(self._brake_status_msg(0)))
+
+  def test_brake_status_mask_with_es_brake_bit_set_rejected(self):
+    """Brake_Status MUST clear the ES_Brake bit (existing invariant from line 259)."""
+    self.assertFalse(self._tx(self._brake_status_msg(1)))
+
+  # ── Gen2 negative ────────────────────────────────────────────────────────────
+
+  def test_gen2_long_with_brake_intercept_uses_gen2_long_path(self):
+    """
+    Gen2 + LONG + brake_intercept must continue to use SUBARU_GEN2_LONG_TX_MSGS
+    (no AVH support on gen2 — interfaces.py never sets BRAKE_HOLD on gen2 anyway,
+    but panda must not silently accept Brake_Status on the cam bus for gen2).
+    """
+    self.safety.set_current_safety_param_sp(SubaruSafetyFlagsSP.BRAKE_INTERCEPT)
+    self.safety.set_safety_hooks(CarParams.SafetyModel.subaru,
+                                  SubaruSafetyFlags.LONG | SubaruSafetyFlags.GEN2)
+    self.safety.init_tests()
+    # Brake_Status must NOT be in gen2 long allowlist.
+    self.assertFalse(self._tx(self._brake_status_msg(0)))
+
+
 if __name__ == "__main__":
   unittest.main()
