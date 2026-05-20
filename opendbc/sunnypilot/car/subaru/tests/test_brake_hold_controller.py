@@ -236,9 +236,9 @@ class TestBrakeHoldController:
   # -----------------------------------------------------------------------
 
   def _get_brake_value(self, mock_bh):
-    """Extract the brake_value positional arg (4th arg) from the mock call."""
+    """Extract the brake_value positional arg (5th arg) from the mock call."""
     assert mock_bh.called, "create_es_brake_hold was not called"
-    return mock_bh.call_args[0][3]  # (packer, frame, es_brake_msg, brake_value)
+    return mock_bh.call_args[0][4]  # (packer, frame, es_brake_msg, long_enabled, brake_value)
 
   def test_holding_requires_primed(self):
     """primed=False, standstill=True → no create_es_brake_hold call (stay out of Eyesight's way)."""
@@ -556,8 +556,9 @@ class TestACCInterferenceRegression:
       CS=make_CS(standstill=True, brakePressed=False, gasPressed=False),
     )
     assert mock_bh.called
-    # Fourth positional arg is brake_value
-    assert mock_bh.call_args[0][3] == CarControllerParams.BRAKE_HOLD_PRESSURE
+    # Args: (packer, frame, es_brake_msg, long_enabled, brake_value)
+    assert mock_bh.call_args[0][3] is False  # stock Eyesight ACC — forward fault verbatim
+    assert mock_bh.call_args[0][4] == CarControllerParams.BRAKE_HOLD_PRESSURE
     assert mock_bsh.called
 
   def test_aeb_passthrough_keeps_both_messages(self):
@@ -581,7 +582,7 @@ class TestACCInterferenceRegression:
                  gasPressed=False, es_brake_msg=aeb_msg),
     )
     assert mock_bh.called
-    assert mock_bh.call_args[0][3] == 600
+    assert mock_bh.call_args[0][4] == 600
     assert mock_bsh.called, "AEB must keep the Brake_Status mask active"
 
   def test_brake_hold_active_tracks_state(self):
@@ -674,8 +675,9 @@ class TestAlphaLongCoexistence:
     )
     assert mock_bh.called, "create_es_brake_hold must run when alpha long enabled but inactive"
     assert not mock_eb.called, "create_es_brake must NOT run when AVH is asserting ES_Brake"
-    # Hold pressure passed through.
-    assert mock_bh.call_args[0][3] == CarControllerParams.BRAKE_HOLD_PRESSURE
+    # Args: (packer, frame, es_brake_msg, long_enabled, brake_value)
+    assert mock_bh.call_args[0][3] is True  # alpha long enabled — clear the latched fault
+    assert mock_bh.call_args[0][4] == CarControllerParams.BRAKE_HOLD_PRESSURE
 
   def test_avh_yields_when_alpha_long_active(self):
     """openpilotLongitudinalControl=True, CC.longActive=True

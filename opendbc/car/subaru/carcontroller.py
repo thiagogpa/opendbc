@@ -180,7 +180,7 @@ class CarController(CarControllerBase, SnGCarController):
           # ES_Brake arbitration: AVH wins when op long is not actively braking.
           if avh_owns_es_brake:
             can_sends.append(
-              subarucan.create_es_brake_hold(self.packer, self.frame // 5, CS.es_brake_msg, brake_hold_value)
+              subarucan.create_es_brake_hold(self.packer, self.frame // 5, CS.es_brake_msg, self.CP.openpilotLongitudinalControl, brake_hold_value)
             )
           else:
             can_sends.append(
@@ -200,7 +200,7 @@ class CarController(CarControllerBase, SnGCarController):
 
         if avh_owns_es_brake and self.frame % 5 == 0:
           can_sends.append(subarucan.create_es_brake_hold(
-            self.packer, self.frame // 5, CS.es_brake_msg, brake_hold_value
+            self.packer, self.frame // 5, CS.es_brake_msg, self.CP.openpilotLongitudinalControl, brake_hold_value
           ))
 
       # Brake_Status mask follows AVH state. When op long is actively braking,
