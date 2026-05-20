@@ -87,12 +87,25 @@ def test_cruise_activated_passthrough():
   assert v["Cruise_Activated"] == 1
 
 
-def test_cruise_brake_fault_passthrough():
-  """Cruise_Brake_Fault forwarded verbatim — NOT cleared (contrast with create_es_brake which clears it)."""
+def test_cruise_brake_fault_cleared():
+  """Cruise_Brake_Fault is forced to 0 — the car ignores a brake command that carries a fault flag.
+  Eyesight latches Cruise_Brake_Fault=1 after op-long ACC engages once; forwarding it verbatim
+  poisoned the AVH hold (car rolled). See route dde08cad3a74cd94/00000014--7d3ff4c569."""
   packer = make_packer()
   subarucan.create_es_brake_hold(packer, frame=0, es_brake_msg=make_es_brake_msg(Cruise_Brake_Fault=1), brake_value=100)
   v = get_values(packer)
-  assert v["Cruise_Brake_Fault"] == 1
+  assert v["Cruise_Brake_Fault"] == 0
+
+
+def test_hold_pressure_with_eyesight_fault_latched():
+  """Regression: post-alpha-long-ACC, Eyesight es_brake_msg has Cruise_Brake_Fault=1.
+  The 600-unit hold must still go out with fault cleared so the car honors it."""
+  packer = make_packer()
+  subarucan.create_es_brake_hold(packer, frame=0, es_brake_msg=make_es_brake_msg(Cruise_Brake_Fault=1), brake_value=600)
+  v = get_values(packer)
+  assert v["Brake_Pressure"] == 600
+  assert v["Cruise_Brake_Active"]
+  assert v["Cruise_Brake_Fault"] == 0
 
 
 def test_aeb_status_passthrough():

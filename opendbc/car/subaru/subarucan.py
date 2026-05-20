@@ -222,13 +222,16 @@ def create_es_brake_hold(packer, frame, es_brake_msg, brake_value):
   ]}
   values["COUNTER"] = frame % 0x10
 
-  # Override only the three brake-relevant fields; all others pass through from Eyesight.
+  # Override the brake-relevant fields; all others pass through from Eyesight.
   # Cruise_Activated NOT set — forwarded verbatim. During manual driving (ACC off),
   # Eyesight sends Cruise_Activated=0; setting it to 1 risks Eyesight fault detection.
-  # Cruise_Brake_Fault NOT cleared — contrast with create_es_brake (full longitudinal takeover).
+  # Cruise_Brake_Fault forced to 0: once op-long ACC engages, Eyesight latches this
+  # fault for the rest of the drive, and the car ignores any ES_Brake pressure that
+  # carries it — which silently defeated the AVH hold. Mirrors create_es_brake.
   values["Brake_Pressure"] = brake_value
   values["Cruise_Brake_Active"] = brake_value > 0
   values["Cruise_Brake_Lights"] = brake_value >= 70  # mirrors create_es_brake threshold
+  values["Cruise_Brake_Fault"] = 0
 
   return packer.make_can_msg("ES_Brake", CanBus.main, values)
 
