@@ -20,7 +20,8 @@ class MadsCarState(MadsCarStateBase):
     super().__init__(CP, CP_SP)
 
   @staticmethod
-  def create_lkas_button_events(cur_btn: int, prev_btn: int, buttons_dict: dict[int, structs.CarState.ButtonEvent.Type]) -> list[structs.CarState.ButtonEvent]:
+  def create_lkas_button_events(cur_btn: int, prev_btn: int,
+                                buttons_dict: dict[int, structs.CarState.ButtonEvent.Type]) -> list[structs.CarState.ButtonEvent]:
     events: list[structs.CarState.ButtonEvent] = []
 
     if cur_btn == prev_btn:
@@ -33,7 +34,8 @@ class MadsCarState(MadsCarStateBase):
 
     for change in state_changes:
       if change["pressed"]:
-        events.append(structs.CarState.ButtonEvent(pressed=change["pressed"], type=buttons_dict.get(cur_btn, ButtonType.unknown)))
+        events.append(structs.CarState.ButtonEvent(pressed=change["pressed"],
+                                                   type=buttons_dict.get(cur_btn, ButtonType.unknown)))
     return events
 
   def update_mads(self, ret: structs.CarState, can_parsers: dict[StrEnum, CANParser]) -> None:
