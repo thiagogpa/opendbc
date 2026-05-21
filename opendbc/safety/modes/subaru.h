@@ -221,6 +221,9 @@ static bool subaru_tx_hook(const CANPacket_t *msg) {
       bool standstill_or_settling = !vehicle_moving || (brake_intercept_release_countdown < BRAKE_INTERCEPT_RELEASE_FRAMES);
 
       bool avh_pressure_invalid = (es_brake_pressure > SUBARU_LONG_LIMITS.max_brake);
+      // Gas is intentionally NOT gated on the AVH path: the controller owns the gas-release UX,
+      // the same ES_Brake frame carries Eyesight's AEB echo (which must never be gas-gated), and
+      // braking is the fail-safe direction (already bounded by authority + pressure + standstill).
       bool avh_no_authority     = (!controls_allowed && !controls_allowed_lateral) && (es_brake_pressure != 0);
       bool avh_not_standstill   = !standstill_or_settling && (es_brake_pressure != 0);
       bool avh_valid = !(avh_pressure_invalid || avh_no_authority || avh_not_standstill);

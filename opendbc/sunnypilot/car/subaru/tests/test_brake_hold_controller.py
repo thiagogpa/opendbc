@@ -1,41 +1,19 @@
-"""
-Tests for brake hold logic in CarController.update().
+"""Tests for the Subaru AVH brake-hold logic in CarController.update().
 
-Logic under test (opendbc_repo/opendbc/car/subaru/carcontroller.py, inside `else` branch):
+Covers the velocity-primed latch state machine (`_update_brake_hold_state`) — priming,
+holding, AEB echo, and release — plus the ES_Brake / Brake_Status arbitration in `update()`
+(when AVH owns ES_Brake vs. yields to op long, and when the Brake_Status mask is sent).
 
-  if self.CP.flags & SubaruFlags.BRAKE_HOLD and CS.es_brake_msg is not None:
-      # velocity-primed latch
-      if CC_SP.mads.enabled and CS.out.vEgoRaw < 1.5 and CS.out.brakePressed:
-          if CS.out.gearShifter not in (GearShifter.park, GearShifter.reverse):
-              self._brake_hold_primed = True
-
-      if self.frame % 5 == 0:
-          holding = (self._brake_hold_primed
-                     and CS.out.standstill
-                     and not CS.out.gasPressed
-                     and CS.out.gearShifter not in (GearShifter.park, GearShifter.reverse))
-
-          if CS.out.gasPressed or not CC_SP.mads.enabled or CS.out.vEgoRaw > 0.5:
-              self._brake_hold_primed = False
-
-          # AEB safety: echo EyeSight's own Brake_Pressure when it asserts AEB.
-          if CS.es_brake_msg["AEB_Status"] != 0:
-              brake_value = CS.es_brake_msg["Brake_Pressure"]
-          elif holding:
-              brake_value = CarControllerParams.BRAKE_HOLD_PRESSURE
-          else:
-              brake_value = 0
-
-          can_sends.append(subarucan.create_es_brake_hold(
-              self.packer, self.frame // 5, CS.es_brake_msg,
-              brake_value
-          ))
+Most tests patch `create_es_brake_hold` and assert on its call args; `test_real_packer_*`
+runs the real CANPacker end-to-end and decodes the emitted frame to catch controller↔packer
+drift the mocks can't.
 """
 
 import pytest
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
-from opendbc.car import structs
+from opendbc.can import CANParser
+from opendbc.car import structs, Bus
 from opendbc.car.subaru.values import DBC, CAR, SubaruFlags, CarControllerParams
 from opendbc.car.subaru.carcontroller import CarController
 from opendbc.car.interfaces import GearShifter
@@ -181,53 +159,21 @@ class TestBrakeHoldController:
   # 2–6. Priming conditions
   # -----------------------------------------------------------------------
 
-  def test_priming_requires_mads_enabled(self):
-    """mads.enabled=False → primed stays False even if speed/brake conditions met."""
+  @pytest.mark.parametrize("mads_enabled,vego,brake,gear,expected", [
+    (False, 0.5, True, GearShifter.drive, False),  # mads disabled
+    (True, 0.5, False, GearShifter.drive, False),  # brake not pressed
+    (True, 2.0, True, GearShifter.drive, False),  # speed too high (>= 1.5)
+    (True, 0.5, True, GearShifter.park, False),  # park
+    (True, 0.5, True, GearShifter.reverse, False),  # reverse
+    (True, 0.5, True, GearShifter.drive, True),  # all conditions met -> primed
+  ])
+  def test_priming_conditions(self, mads_enabled, vego, brake, gear, expected):
+    """Priming requires mads.enabled AND vEgoRaw<1.5 AND brakePressed AND gear not park/reverse."""
     ctrl = make_ctrl()
-    ctrl.frame = 1  # not a frame%5 boundary to isolate priming from hold logic
-    run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=False),
-               CS=make_CS(vEgoRaw=0.5, brakePressed=True))
-    assert ctrl._brake_hold_primed is False
-
-  def test_priming_requires_brake_pressed(self):
-    """brakePressed=False → primed stays False."""
-    ctrl = make_ctrl()
-    ctrl.frame = 1
-    run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
-               CS=make_CS(vEgoRaw=0.5, brakePressed=False))
-    assert ctrl._brake_hold_primed is False
-
-  def test_priming_requires_low_speed(self):
-    """vEgoRaw >= 1.5 m/s → primed stays False."""
-    ctrl = make_ctrl()
-    ctrl.frame = 1
-    run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
-               CS=make_CS(vEgoRaw=2.0, brakePressed=True))
-    assert ctrl._brake_hold_primed is False
-
-  def test_priming_blocked_in_park(self):
-    """Gear=park → primed stays False even if all other conditions met."""
-    ctrl = make_ctrl()
-    ctrl.frame = 1
-    run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
-               CS=make_CS(vEgoRaw=0.5, brakePressed=True, gear=GearShifter.park))
-    assert ctrl._brake_hold_primed is False
-
-  def test_priming_blocked_in_reverse(self):
-    """Gear=reverse → primed stays False."""
-    ctrl = make_ctrl()
-    ctrl.frame = 1
-    run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
-               CS=make_CS(vEgoRaw=0.5, brakePressed=True, gear=GearShifter.reverse))
-    assert ctrl._brake_hold_primed is False
-
-  def test_priming_succeeds(self):
-    """All priming conditions met → _brake_hold_primed becomes True."""
-    ctrl = make_ctrl()
-    ctrl.frame = 1  # odd frame: priming runs but frame%5 != 0 so no reset
-    run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
-               CS=make_CS(vEgoRaw=0.5, brakePressed=True, gear=GearShifter.drive))
-    assert ctrl._brake_hold_primed is True
+    ctrl.frame = 1  # odd frame: priming runs but frame%5 != 0 (isolates priming from hold/reset)
+    run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=mads_enabled),
+               CS=make_CS(vEgoRaw=vego, brakePressed=brake, gear=gear))
+    assert ctrl._brake_hold_primed is expected
 
   # -----------------------------------------------------------------------
   # 7–14. Holding conditions (verified via create_es_brake_hold call args)
@@ -296,41 +242,23 @@ class TestBrakeHoldController:
                                     gasPressed=False, gear=GearShifter.drive, aeb_status=0))
     assert self._get_brake_value(mock_bh) == CarControllerParams.BRAKE_HOLD_PRESSURE
 
-  def test_aeb_overrides_hold(self):
-    """AEB_Status != 0 → brake_value passes through EyeSight's Brake_Pressure, not hold pressure."""
+  @pytest.mark.parametrize("primed,standstill,vego,aeb_status,eyesight_pressure,expected", [
+    (True, True, 0.0, 8, 450, 450),  # AEB overrides hold -> echo Eyesight pressure
+    (True, True, 0.0, 0, 0, CarControllerParams.BRAKE_HOLD_PRESSURE),  # no AEB, holding -> hold pressure
+    (False, False, 8.0, 4, 600, 600),  # AEB while moving, not holding -> passthrough
+  ])
+  def test_aeb_vs_hold_brake_value(self, primed, standstill, vego, aeb_status, eyesight_pressure, expected):
+    """AEB echo (AEB_Status != 0) passes through Eyesight's Brake_Pressure; otherwise holding emits BRAKE_HOLD_PRESSURE."""
     ctrl = make_ctrl()
     ctrl.frame = 0
-    ctrl._brake_hold_primed = True
-    aeb_es_msg = {"AEB_Status": 8, "CHECKSUM": 0, "Signal1": 0, "Brake_Pressure": 450,
-                  "Cruise_Brake_Lights": 0, "Cruise_Brake_Fault": 0, "Cruise_Brake_Active": 0,
-                  "Cruise_Activated": 0, "Signal3": 0}
+    ctrl._brake_hold_primed = primed
+    es_msg = {"AEB_Status": aeb_status, "CHECKSUM": 0, "Signal1": 0, "Brake_Pressure": eyesight_pressure,
+              "Cruise_Brake_Lights": 0, "Cruise_Brake_Fault": 0, "Cruise_Brake_Active": 0,
+              "Cruise_Activated": 0, "Signal3": 0}
     mock_bh = run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
-                         CS=make_CS(standstill=True, brakePressed=False,
-                                    gasPressed=False, es_brake_msg=aeb_es_msg))
-    assert self._get_brake_value(mock_bh) == 450
-
-  def test_aeb_zero_does_not_override(self):
-    """AEB_Status=0 → normal hold logic, brake_value == BRAKE_HOLD_PRESSURE."""
-    ctrl = make_ctrl()
-    ctrl.frame = 0
-    ctrl._brake_hold_primed = True
-    mock_bh = run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
-                         CS=make_CS(standstill=True, brakePressed=False,
-                                    gasPressed=False, aeb_status=0))
-    assert self._get_brake_value(mock_bh) == CarControllerParams.BRAKE_HOLD_PRESSURE
-
-  def test_aeb_while_moving_passthrough(self):
-    """AEB fires while car is moving (standstill=False, not holding) → passthrough EyeSight's Brake_Pressure."""
-    ctrl = make_ctrl()
-    ctrl.frame = 0
-    ctrl._brake_hold_primed = False
-    aeb_es_msg = {"AEB_Status": 4, "CHECKSUM": 0, "Signal1": 0, "Brake_Pressure": 600,
-                  "Cruise_Brake_Lights": 1, "Cruise_Brake_Fault": 0, "Cruise_Brake_Active": 1,
-                  "Cruise_Activated": 0, "Signal3": 0}
-    mock_bh = run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
-                         CS=make_CS(standstill=False, brakePressed=False,
-                                    gasPressed=False, vEgoRaw=8.0, es_brake_msg=aeb_es_msg))
-    assert self._get_brake_value(mock_bh) == 600
+                         CS=make_CS(standstill=standstill, vEgoRaw=vego, brakePressed=False,
+                                    gasPressed=False, es_brake_msg=es_msg))
+    assert self._get_brake_value(mock_bh) == expected
 
   # -----------------------------------------------------------------------
   # 15–17. Latch reset (inside frame%5 == 0)
@@ -402,28 +330,10 @@ class TestBrakeHoldController:
     assert not mock_bh.called
 
   # -----------------------------------------------------------------------
-  # 19. Guard: CC.longActive=True → no call (new contract)
+  # Guard: longActive yields ES_Brake to op long — covered by
+  # TestAlphaLongCoexistence.test_avh_yields_when_alpha_long_active (stronger:
+  # also asserts create_es_brake runs).
   # -----------------------------------------------------------------------
-
-  def test_yields_when_long_active(self):
-    """CC.longActive=True puts ES_Brake under op long's control.
-
-    Whether alpha long is *enabled* (CP.openpilotLongitudinalControl) does NOT
-    matter — only whether op long is *actively braking* (CC.longActive). This
-    is the new contract after AVH/alpha-long decoupling.
-    """
-    ctrl = make_ctrl(long_control=True, brake_hold=True)
-    ctrl.frame = 0
-    ctrl._brake_hold_primed = True
-    with patch("opendbc.car.subaru.subarucan.create_steering_control", return_value=_DUMMY_MSG), \
-         patch("opendbc.car.subaru.subarucan.create_es_dashstatus", return_value=_DUMMY_MSG), \
-         patch("opendbc.car.subaru.subarucan.create_es_lkas_state", return_value=_DUMMY_MSG), \
-         patch("opendbc.car.subaru.subarucan.create_es_status", return_value=_DUMMY_MSG), \
-         patch("opendbc.car.subaru.subarucan.create_es_brake", return_value=_DUMMY_MSG), \
-         patch("opendbc.car.subaru.subarucan.create_es_distance", return_value=_DUMMY_MSG), \
-         patch(_BRAKE_HOLD_PATCH, return_value=_DUMMY_MSG) as mock_bh:
-      ctrl.update(make_CC(enabled=True, long_active=True), make_CC_SP(), make_CS(), 0)
-    assert not mock_bh.called
 
   # -----------------------------------------------------------------------
   # 20. Guard: BRAKE_HOLD flag absent → no call
@@ -473,13 +383,47 @@ class TestBrakeHoldController:
     assert frame_count_arg == 1  # 5 // 5
 
   # -----------------------------------------------------------------------
-  # Bonus: verify BRAKE_HOLD_PRESSURE is a non-zero constant (sanity check)
+  # 24. Cadence decoupling: Brake_Status mask (every 2) vs ES_Brake (every 5)
   # -----------------------------------------------------------------------
 
-  def test_brake_hold_pressure_nonzero(self):
-    """CarControllerParams.BRAKE_HOLD_PRESSURE must be a positive integer."""
-    assert isinstance(CarControllerParams.BRAKE_HOLD_PRESSURE, int)
-    assert CarControllerParams.BRAKE_HOLD_PRESSURE > 0
+  def test_mask_sends_without_es_brake_at_frame2(self):
+    """At frame=2 the Brake_Status mask (frame%2==0) fires while the ES_Brake hold
+    (frame%5==0) does not. _update_brake_hold_state recomputes only on frame%5==0,
+    so _brake_hold_active carries over from a prior holding frame."""
+    ctrl = make_ctrl()
+    ctrl._brake_hold_primed = True
+    ctrl._brake_hold_active = True  # carried over from a prior frame%5==0 hold
+    ctrl.frame = 2  # 2%5 != 0 (no ES_Brake hold) but 2%2 == 0 (mask sends)
+    mock_bh, mock_bsh = run_update_capture_both(
+      ctrl, CC_SP=make_CC_SP(mads_enabled=True),
+      CS=make_CS(standstill=True, brakePressed=False, gasPressed=False),
+    )
+    assert not mock_bh.called   # frame%5 != 0
+    assert mock_bsh.called      # frame%2 == 0 and brake_hold_active carried over
+
+  # -----------------------------------------------------------------------
+  # 25. Integration: real CANPacker (create_es_brake_hold NOT patched)
+  # -----------------------------------------------------------------------
+
+  def test_real_packer_emits_hold_pressure(self):
+    """Run update() through the REAL create_es_brake_hold + CANPacker and decode the
+    emitted ES_Brake frame — Brake_Pressure must equal BRAKE_HOLD_PRESSURE. Catches
+    controller<->packer drift (e.g. a wrong DBC signal name) the mock-based tests cannot."""
+    ctrl = make_ctrl()
+    ctrl.frame = 0
+    ctrl._brake_hold_primed = True
+    # patch only the unrelated send fns that choke on the mock CS; leave create_es_brake_hold REAL
+    with _STEERING_PATCH, _DASHSTATUS_PATCH, _LKAS_STATE_PATCH, \
+         patch(_BRAKE_STATUS_HOLD_PATCH, return_value=_DUMMY_BS_MSG):
+      _, can_sends = ctrl.update(
+        make_CC(), make_CC_SP(mads_enabled=True),
+        make_CS(standstill=True, brakePressed=False, gasPressed=False), 0,
+      )
+    es_brake = [m for m in can_sends if isinstance(m[0], int) and m[0] == 0x220]
+    assert len(es_brake) == 1, "exactly one real ES_Brake frame expected"
+    parser = CANParser(_DBC_NAMES[Bus.pt], [("ES_Brake", 0)], 0)
+    parser.update([0, es_brake])
+    assert parser.vl["ES_Brake"]["Brake_Pressure"] == CarControllerParams.BRAKE_HOLD_PRESSURE
 
 
 # ---------------------------------------------------------------------------

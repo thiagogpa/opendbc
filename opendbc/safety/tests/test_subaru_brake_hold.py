@@ -34,7 +34,7 @@ MSG_SUBARU_Brake_Pedal  = 0x139
 MSG_SUBARU_Brake_Status = 0x13C
 
 BRAKE_INTERCEPT_RELEASE_FRAMES = 3  # must match C #define
-SUBARU_BRAKE_HOLD_ACTIVE_FRAMES = 4  # must match C #define (~200ms at 20Hz Wheel_Speeds)
+SUBARU_BRAKE_HOLD_ACTIVE_FRAMES = 4  # must match C #define (~80ms at 50Hz Wheel_Speeds, 1 frame = 20ms)
 
 
 class TestSubaruBrakeIntercept(TestSubaruSafetyBase):
@@ -184,6 +184,17 @@ class TestSubaruBrakeIntercept(TestSubaruSafetyBase):
     self.safety.set_controls_allowed(False)
     self.safety.set_controls_allowed_lateral(True)
     self.assertTrue(self._tx(self._es_brake_msg(100)))
+
+  def test_es_brake_allowed_with_gas_pressed_at_standstill(self):
+    """Gas is intentionally NOT gated on the AVH path: an injected hold at standstill is allowed
+    even with the gas pressed. This is deliberate — the controller owns the gas-release UX, the
+    same ES_Brake frame carries Eyesight's AEB echo (which must never be gas-gated), and braking
+    is the fail-safe direction (already bounded by authority + pressure + standstill)."""
+    self._set_standstill()
+    self.safety.set_controls_allowed(False)
+    self.safety.set_controls_allowed_lateral(True)
+    self._rx(self._user_gas_msg(2000))  # driver on the gas
+    self.assertTrue(self._tx(self._es_brake_msg(600)))
 
   # ── non-zero pressure when moving (hysteresis exhausted) ────────────────────
 

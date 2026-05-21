@@ -1,5 +1,7 @@
 from unittest.mock import MagicMock
-from opendbc.car.subaru.values import CanBus
+from opendbc.can import CANPacker
+from opendbc.car import Bus
+from opendbc.car.subaru.values import DBC, CAR, CanBus
 from opendbc.car.subaru import subarucan
 
 
@@ -179,3 +181,29 @@ def test_bus_is_main():
   call_args = packer.make_can_msg.call_args
   bus = call_args[0][1]
   assert bus == CanBus.main
+
+
+# --- Stock-path (long_enabled=False) brake-field packing ---
+
+def test_stock_path_sets_brake_active_and_lights():
+  """long_enabled=False (stock Eyesight ACC): Cruise_Brake_Active / Cruise_Brake_Lights are still
+  derived from brake_value. Only Cruise_Brake_Fault handling differs between the long/stock paths."""
+  packer = make_packer()
+  subarucan.create_es_brake_hold(packer, frame=0, es_brake_msg=make_es_brake_msg(), long_enabled=False, brake_value=100)
+  v = get_values(packer)
+  assert v["Brake_Pressure"] == 100
+  assert v["Cruise_Brake_Active"]
+  assert v["Cruise_Brake_Lights"]  # 100 >= 70
+
+
+# --- Real CANPacker smoke test (catches DBC signal-name drift) ---
+
+def test_real_packer_accepts_signals():
+  """Pack with a REAL CANPacker so a typo'd / removed DBC signal name would raise, unlike the
+  MagicMock packer used elsewhere. Asserts a valid ES_Brake frame (0x220, main bus, 8 bytes)."""
+  packer = CANPacker(DBC[CAR.SUBARU_IMPREZA_2020.value][Bus.pt])
+  addr, dat, bus = subarucan.create_es_brake_hold(packer, frame=0, es_brake_msg=make_es_brake_msg(),
+                                                  long_enabled=True, brake_value=600)
+  assert addr == 0x220
+  assert bus == CanBus.main
+  assert len(dat) == 8
