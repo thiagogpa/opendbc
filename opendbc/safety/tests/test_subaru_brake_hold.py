@@ -2,11 +2,7 @@
 """
 Panda safety tests for the Subaru brake-intercept feature.
 
-TDD: tests written BEFORE tx_hook guard implementation.
-All brake-intercept-specific tests will FAIL until subaru.h tx_hook
-gains the brake_intercept branch.
-
-RACE-A counter mechanics (rx_hook counts UP):
+Settling-window counter mechanics (rx_hook counts UP):
   standstill → countdown = 0 (reset on each zero-speed frame)
   moving frame 1 → countdown = 1  (1 < 3 → settling)
   moving frame 2 → countdown = 2  (2 < 3 → settling)
@@ -21,7 +17,6 @@ import unittest
 from opendbc.car.structs import CarParams
 from opendbc.car.subaru.values import SubaruSafetyFlags
 from opendbc.safety.tests.libsafety import libsafety_py
-import opendbc.safety.tests.common as common
 from opendbc.safety.tests.common import CANPackerSafety
 from opendbc.sunnypilot.car.subaru.values_ext import SubaruSafetyFlagsSP
 
@@ -29,7 +24,6 @@ from opendbc.sunnypilot.car.subaru.values_ext import SubaruSafetyFlagsSP
 from opendbc.safety.tests.test_subaru import (
   SubaruMsg,
   SUBARU_MAIN_BUS,
-  SUBARU_ALT_BUS,
   SUBARU_CAM_BUS,
   lkas_tx_msgs,
   TestSubaruSafetyBase,
@@ -209,7 +203,7 @@ class TestSubaruBrakeIntercept(TestSubaruSafetyBase):
       with self.subTest(pressure=pressure):
         self.assertFalse(self._tx(self._es_brake_msg(pressure)))
 
-  # ── RACE-A hysteresis ────────────────────────────────────────────────────────
+  # ── settling-window hysteresis ───────────────────────────────────────────────
 
   def test_race_a_allowed_during_hysteresis_frame1(self):
     """
@@ -335,17 +329,15 @@ class TestSubaruBrakeIntercept(TestSubaruSafetyBase):
     self.assertFalse(self._tx(self._es_brake_msg(0)))
     self.assertFalse(self._tx(self._es_brake_msg(100)))
 
-  # ── ACC-fault fix (2026-05-11): conditional forwarding ──────────────────────
+  # ── Conditional forwarding ───────────────────────────────────────────────────
   #
-  # Background: in brake-intercept mode, Panda used to UNCONDITIONALLY block
-  # ES_Brake (CAM→MAIN) and Brake_Status (MAIN→CAM) forwarding. This broke
-  # Eyesight's native ACC braking: Eyesight's ES_Brake never reached the braking
-  # module, and the module's Brake_Status (ES_Brake=1 confirmation) never
-  # reached Eyesight → Cruise_Fault watchdog within ~566ms.
-  #
-  # Fix: forwarding is CONDITIONALLY blocked only while we are actively asserting
-  # a hold. The active-hold state is tracked via a Wheel_Speeds-paced countdown
-  # set on TX of ES_Brake (Brake_Pressure>0) or Brake_Status (the mask).
+  # In brake-intercept mode, ES_Brake (CAM→MAIN) and Brake_Status (MAIN→CAM) forwarding is
+  # blocked only while openpilot is actively asserting a hold — not unconditionally.
+  # Unconditional blocking would break Eyesight's native ACC braking: Eyesight's ES_Brake
+  # would never reach the braking module, and the module's Brake_Status (ES_Brake=1
+  # confirmation) would never reach Eyesight → Cruise_Fault watchdog within ~566ms.
+  # The active-hold state is tracked via a Wheel_Speeds-paced countdown set on TX of
+  # ES_Brake (Brake_Pressure>0) or Brake_Status (the mask).
 
   def _brake_status_mask_msg(self):
     return self.packer.make_can_msg_safety("Brake_Status", SUBARU_CAM_BUS,
@@ -652,7 +644,7 @@ class TestSubaruLongBrakeIntercept(TestSubaruBrakeIntercept):
   def test_avh_hold_pressure_blocked_when_moving_without_acc(self):
     """
     Safety invariant: with only MADS (no ACC), brake injection is allowed
-    ONLY at standstill (+ RACE-A settling window). Once truly rolling, AVH is blocked.
+    ONLY at standstill (+ the settling window). Once truly rolling, AVH is blocked.
     """
     self._exhaust_hysteresis()                          # countdown maxed → no longer settling
     self.safety.set_controls_allowed(False)

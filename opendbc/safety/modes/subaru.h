@@ -326,7 +326,12 @@ static safety_config subaru_init(uint16_t param) {
   };
 
   // Brake-intercept only (no SnG active): includes ES_Brake with check_relay=true.
-  // Brake_Pedal (0x139) included for SnG resume compat — harmless when SnG is not active.
+  // NOTE: the brake-hold feature injects ES_Brake (0x220) only — it never sends Brake_Pedal
+  // (0x139); that is sent solely by the SnG controller. This Brake_Pedal entry is a leftover
+  // from the abandoned Brake_Pedal-injection approach. With check_relay=true (no
+  // disable_static_blocking) it statically blocks the real Brake_Pedal from forwarding
+  // MAIN→CAM with no replacement when SnG is off. Retained pending hardware verification that
+  // dropping it is safe on stock Eyesight; see docs review (P3) for the open question.
   // Does NOT include full SUBARU_STOP_AND_GO_TX_MSGS (Throttle + Brake_Pedal) because
   // that would block Eyesight's Throttle with no replacement — fatal regression.
   // ES_Brake / Brake_Status: check_relay=true kept for relay-malfunction detection, but
@@ -352,8 +357,9 @@ static safety_config subaru_init(uint16_t param) {
     {MSG_SUBARU_Brake_Status, SUBARU_CAM_BUS,  8, .check_relay = true, .disable_static_blocking = true},
   };
 
-  // alpha long + brake_intercept (no SnG): long msgs + Brake_Pedal (cam, SnG-resume compat)
-  // + Brake_Status (cam, conditional fwd). ES_Brake is included via SUBARU_COMMON_LONG_TX_MSGS
+  // alpha long + brake_intercept (no SnG): long msgs + Brake_Pedal (cam) + Brake_Status (cam,
+  // conditional fwd). Brake_Pedal here is the same leftover noted on subaru_brake_intercept_tx_msgs
+  // (never sent by the brake-hold feature). ES_Brake is included via SUBARU_COMMON_LONG_TX_MSGS
   // with check_relay=true but no disable_static_blocking — op long owns the cam→main ES_Brake
   // relay; Eyesight's ES_Brake stays statically blocked while long is active.
   // Brake_Status uses disable_static_blocking=true so subaru_fwd_hook controls the block.
