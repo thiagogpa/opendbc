@@ -30,16 +30,9 @@ class CarController(CarControllerBase, SnGCarController):
     self.packer = CANPacker(DBC[CP.carFingerprint][Bus.pt])
 
   def _update_brake_hold_state(self, CC, CC_SP, CS):
-    """Brake-hold state machine. Runs whenever SubaruFlags.BRAKE_HOLD is set.
-
-    Returns (brake_value, brake_hold_active) where:
-      brake_value: int or None — pressure to inject via ES_Brake (None = don't inject)
-      brake_hold_active: bool — whether to mask Brake_Status this cycle
-
-    Side effects: updates self._brake_hold_primed and self._brake_hold_active.
-
-    Pure with respect to long-control flags — caller arbitrates whether to actually
-    send the resulting ES_Brake message.
+    """Velocity-primed brake-hold latch: primes during deceleration before mads.active
+    drops, holds at standstill, releases on gas / mads-off / speed. Pure w.r.t.
+    long-control flags — the caller arbitrates whether to send the ES_Brake message.
     """
     if not (self.CP.flags & SubaruFlags.BRAKE_HOLD) or CS.es_brake_msg is None:
       return None, False
@@ -183,9 +176,8 @@ class CarController(CarControllerBase, SnGCarController):
             self.packer, self.frame // 5, CS.es_brake_msg, self.CP.openpilotLongitudinalControl, brake_hold_value
           ))
 
-      # Brake_Status mask follows AVH state. When op long is actively braking,
-      # _brake_hold_active may still be True (the helper is pure of long-control flags),
-      # so we explicitly gate on `not CC.longActive` to hand the mask off to op long.
+      # Gate the mask on `not CC.longActive` to hand it off to op long when it's
+      # braking (brake_hold_active may still be True since the helper is flag-pure).
       if (self.CP.flags & SubaruFlags.BRAKE_HOLD and self.frame % 2 == 0
           and CS.brake_status_msg is not None and brake_hold_active and not CC.longActive):
         can_sends.append(subarucan_ext.create_brake_status_hold(self.packer, CS.brake_status_msg))

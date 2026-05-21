@@ -79,14 +79,13 @@
 
 static bool subaru_gen2 = false;
 static bool subaru_longitudinal = false;
-// Settling window: Wheel_Speeds frames since vehicle_moving became true. Allows ES_Brake
-// hold injections for a few frames after the transition to cover Python lag (~10ms).
+// Settling window: covers Python lag (~10ms) so hold injections stay valid for a few frames
+// after vehicle_moving transitions.
 static int brake_intercept_release_countdown = 0;
 #define BRAKE_INTERCEPT_RELEASE_FRAMES 3
 
-// Counts down while openpilot is actively asserting a brake hold (decremented per
-// Wheel_Speeds RX). Used by subaru_fwd_hook to conditionally block ES_Brake/Brake_Status
-// forwarding only during a hold; when idle the relays pass so Eyesight's native ACC works.
+// Nonzero while a hold is being asserted; fwd_hook uses it to block the relays only during a
+// hold, so Eyesight's native ACC works when idle.
 static int subaru_brake_hold_active_countdown = 0;
 #define SUBARU_BRAKE_HOLD_ACTIVE_FRAMES 4
 
@@ -142,9 +141,7 @@ static void subaru_rx_hook(const CANPacket_t *msg) {
 
     UPDATE_VEHICLE_SPEED((fr + rr + rl + fl) / 4.0 * 0.057 * KPH_TO_MS);
 
-    // Settling window for brake_intercept — count frames since vehicle_moving became true.
-    // tx_hook uses this to allow ES_Brake hold injections for a few frames after the transition,
-    // covering the ~10ms Python lag at 50Hz Wheel_Speeds (1 frame = 20ms).
+    // Age the settling/hold countdowns off Wheel_Speeds RX (50Hz, 1 frame = 20ms).
     if (subaru_brake_intercept) {
       if (vehicle_moving) {
         if (brake_intercept_release_countdown < BRAKE_INTERCEPT_RELEASE_FRAMES) {
@@ -154,9 +151,7 @@ static void subaru_rx_hook(const CANPacket_t *msg) {
         brake_intercept_release_countdown = 0;
       }
 
-      // Decrement active-hold countdown per Wheel_Speeds RX so it ages out in wall-clock
-      // time. When it reaches 0, fwd_hook restores the ES_Brake/Brake_Status relays so
-      // Eyesight's ACC can operate.
+      // When this hits 0, fwd_hook restores the relays so Eyesight's ACC can operate.
       if (subaru_brake_hold_active_countdown > 0) {
         subaru_brake_hold_active_countdown--;
       }
@@ -205,39 +200,22 @@ static bool subaru_tx_hook(const CANPacket_t *msg) {
     int es_brake_pressure = GET_BYTES(msg, 2, 2);
 
     if (subaru_brake_intercept) {
-      // Union check: ES_Brake accepted if EITHER the AVH-valid set OR the
-      // standard longitudinal-valid set permits it.
-      //
-      // AVH path (active regardless of subaru_longitudinal):
-      //   - pressure ≤ max_brake
-      //   - controls_allowed OR controls_allowed_lateral (MADS active is sufficient)
-      //   - standstill OR within the settling window (BRAKE_INTERCEPT_RELEASE_FRAMES)
-      //
-      // Longitudinal path (only meaningful when subaru_longitudinal is set):
-      //   - get_longitudinal_allowed() (controls_allowed && !gas_pressed_prev)
-      //   - pressure ≤ max_brake
-      //
-      // Either path passing → no violation. Both failing → violation.
+      // ES_Brake is valid if EITHER the AVH set OR the standard longitudinal set permits it.
       bool standstill_or_settling = !vehicle_moving || (brake_intercept_release_countdown < BRAKE_INTERCEPT_RELEASE_FRAMES);
 
       bool avh_pressure_invalid = (es_brake_pressure > SUBARU_LONG_LIMITS.max_brake);
-      // Gas is intentionally NOT gated on the AVH path: the controller owns the gas-release UX,
-      // the same ES_Brake frame carries Eyesight's AEB echo (which must never be gas-gated), and
-      // braking is the fail-safe direction (already bounded by authority + pressure + standstill).
+      // Gas intentionally NOT gated here: the same frame carries Eyesight's AEB echo (which must
+      // never be gas-gated) and braking is fail-safe (bounded by authority + pressure + standstill).
       bool avh_no_authority     = (!controls_allowed && !controls_allowed_lateral) && (es_brake_pressure != 0);
       bool avh_not_standstill   = !standstill_or_settling && (es_brake_pressure != 0);
       bool avh_valid = !(avh_pressure_invalid || avh_no_authority || avh_not_standstill);
 
-      // long_valid only applies when alpha-long is on; in non-long brake_intercept mode
-      // subaru_longitudinal=false so longitudinal_brake_checks is irrelevant.
       bool long_valid = subaru_longitudinal && !longitudinal_brake_checks(es_brake_pressure, SUBARU_LONG_LIMITS);
 
       violation |= !(avh_valid || long_valid);
 
-      // Only bump the active-hold countdown when AVH is asserting a hold (avh_valid path).
-      // Do NOT bump for op-long normal braking (long_valid path) — that would starve
-      // Eyesight's Brake_Status relay during ACC braking and briefly block Eyesight AEB
-      // when op-long disengages.
+      // Bump only on the AVH hold path. Bumping for op-long braking (long_valid) would starve
+      // Eyesight's Brake_Status relay and briefly block Eyesight AEB when op-long disengages.
       if (!violation && avh_valid && (es_brake_pressure > 0)) {
         subaru_brake_hold_active_countdown = SUBARU_BRAKE_HOLD_ACTIVE_FRAMES;
       }
@@ -267,18 +245,14 @@ static bool subaru_tx_hook(const CANPacket_t *msg) {
     violation |= longitudinal_transmission_rpm_checks(transmission_rpm, SUBARU_LONG_LIMITS);
   }
 
-  // Brake_Status masking: openpilot sends modified 0x13C to camera bus with ES_Brake bit cleared
-  // so Eyesight never sees ES_Brake feedback from the braking module during hold.
-  // Panda blocks forwarding of the real 0x13C to camera CONDITIONALLY (via fwd_hook) — only
-  // while a hold is actively being injected. When idle, the real Brake_Status forwards so
-  // Eyesight's ACC sees the braking module's ES_Brake confirmation.
+  // openpilot sends a modified 0x13C (ES_Brake bit cleared) to the camera bus so Eyesight
+  // doesn't see the braking module's ES_Brake feedback during a hold.
   if (msg->addr == MSG_SUBARU_Brake_Status) {
     bool es_brake_bit = (msg->data[7] >> 2) & 1U;
     violation |= !subaru_brake_intercept;  // only allowed in brake_intercept mode
     violation |= es_brake_bit;             // ES_Brake bit must be cleared
 
-    // TXing the mask declares we are actively asserting a hold. Bump the active-hold
-    // countdown so fwd_hook blocks the real Brake_Status while we continue to mask it.
+    // TXing the mask means we're asserting a hold; bump so fwd_hook blocks the real Brake_Status.
     if (!violation) {
       subaru_brake_hold_active_countdown = SUBARU_BRAKE_HOLD_ACTIVE_FRAMES;
     }
@@ -328,20 +302,11 @@ static safety_config subaru_init(uint16_t param) {
     SUBARU_STOP_AND_GO_TX_MSGS
   };
 
-  // Brake-intercept only (no SnG active): includes ES_Brake with check_relay=true.
-  // NOTE: the brake-hold feature injects ES_Brake (0x220) only — it never sends Brake_Pedal
-  // (0x139); that is sent solely by the SnG controller. This Brake_Pedal entry is a leftover
-  // from the abandoned Brake_Pedal-injection approach. With check_relay=true (no
-  // disable_static_blocking) it statically blocks the real Brake_Pedal from forwarding
-  // MAIN→CAM with no replacement when SnG is off. Retained pending hardware verification that
-  // dropping it is safe on stock Eyesight; see docs review (P3) for the open question.
-  // Does NOT include full SUBARU_STOP_AND_GO_TX_MSGS (Throttle + Brake_Pedal) because
-  // that would block Eyesight's Throttle with no replacement — fatal regression.
-  // ES_Brake / Brake_Status: check_relay=true kept for relay-malfunction detection, but
-  // disable_static_blocking=true so the actual relay block is moved into subaru_fwd_hook
-  // (conditional on subaru_brake_hold_active_countdown > 0). This lets Eyesight's native
-  // ACC drive ES_Brake (cam→main) and read Brake_Status feedback (main→cam) when we are
-  // not actively asserting a hold.
+  // Brake-intercept only (no SnG). ES_Brake/Brake_Status keep check_relay=true for malfunction
+  // detection but use disable_static_blocking=true so the relay block lives in subaru_fwd_hook
+  // (only during a hold), letting Eyesight's native ACC drive them when idle.
+  // Brake_Pedal is a leftover from the abandoned Brake_Pedal-injection approach (never sent by
+  // the brake-hold feature); retained pending hardware check that dropping it is safe.
   static const CanMsg subaru_brake_intercept_tx_msgs[] = {
     SUBARU_BASE_TX_MSGS(SUBARU_MAIN_BUS, MSG_SUBARU_ES_LKAS)
     SUBARU_COMMON_TX_MSGS(SUBARU_MAIN_BUS)
@@ -350,8 +315,7 @@ static safety_config subaru_init(uint16_t param) {
     {MSG_SUBARU_Brake_Status, SUBARU_CAM_BUS,  8, .check_relay = true, .disable_static_blocking = true},
   };
 
-  // SnG + brake-intercept combined: full SnG msgs (Throttle + Brake_Pedal) + ES_Brake.
-  // ES_Brake explicitly listed — not inherited from SnG macro.
+  // SnG + brake-intercept: full SnG msgs plus explicitly-listed ES_Brake/Brake_Status.
   static const CanMsg subaru_sng_brake_intercept_tx_msgs[] = {
     SUBARU_BASE_TX_MSGS(SUBARU_MAIN_BUS, MSG_SUBARU_ES_LKAS)
     SUBARU_COMMON_TX_MSGS(SUBARU_MAIN_BUS)
@@ -360,12 +324,9 @@ static safety_config subaru_init(uint16_t param) {
     {MSG_SUBARU_Brake_Status, SUBARU_CAM_BUS,  8, .check_relay = true, .disable_static_blocking = true},
   };
 
-  // alpha long + brake_intercept (no SnG): long msgs + Brake_Pedal (cam) + Brake_Status (cam,
-  // conditional fwd). Brake_Pedal here is the same leftover noted on subaru_brake_intercept_tx_msgs
-  // (never sent by the brake-hold feature). ES_Brake is included via SUBARU_COMMON_LONG_TX_MSGS
-  // with check_relay=true but no disable_static_blocking — op long owns the cam→main ES_Brake
-  // relay; Eyesight's ES_Brake stays statically blocked while long is active.
-  // Brake_Status uses disable_static_blocking=true so subaru_fwd_hook controls the block.
+  // alpha long + brake_intercept (no SnG). ES_Brake comes from SUBARU_COMMON_LONG_TX_MSGS with
+  // static blocking on — op long owns the cam→main relay. Brake_Status uses conditional fwd_hook
+  // blocking. Brake_Pedal is the same abandoned-approach leftover noted above.
   static const CanMsg subaru_long_brake_intercept_tx_msgs[] = {
     SUBARU_BASE_TX_MSGS(SUBARU_MAIN_BUS, MSG_SUBARU_ES_LKAS)
     SUBARU_COMMON_LONG_TX_MSGS(SUBARU_MAIN_BUS)
@@ -430,10 +391,8 @@ static safety_config subaru_init(uint16_t param) {
   return ret;
 }
 
-// Conditionally block ES_Brake (cam→main) and Brake_Status (main→cam) forwarding only
-// while openpilot is actively asserting a brake hold.
-// The TX entries set disable_static_blocking=true so safety_fwd_hook's default static
-// block is skipped; this hook reimposes the block when subaru_brake_hold_active_countdown>0.
+// The TX entries set disable_static_blocking=true, so this hook reimposes the relay block on
+// ES_Brake (cam→main) and Brake_Status (main→cam) only while a hold is being asserted.
 static bool subaru_fwd_hook(int bus_num, int addr) {
   bool block = false;
   if (subaru_brake_intercept && (subaru_brake_hold_active_countdown > 0)) {

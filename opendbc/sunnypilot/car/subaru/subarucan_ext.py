@@ -69,15 +69,9 @@ def create_brake_pedal(packer, CP, brake_pedal_msg, send_resume):
 
 
 def create_brake_status_hold(packer, brake_status_msg: dict):
-  """Send Brake_Status to camera bus with ES_Brake bit cleared.
-
-  Panda blocks forwarding of the real Brake_Status (which has ES_Brake=1 when
-  the braking module responds to our hold injection) to camera bus 2.
-  This masked copy with ES_Brake=0 is what Eyesight sees, preventing its ~566ms
-  fault watchdog from triggering on unexpected cruise-brake activity.
-
-  Uses the same COUNTER as received — we're replacing a forwarded-unmodified
-  message, not generating a new sequence.
+  """Send Brake_Status to camera bus with ES_Brake cleared so Eyesight never sees the
+  braking module's ES_Brake feedback during a hold (else its ~566ms fault watchdog trips).
+  Reuses the received COUNTER since we replace a forwarded-unmodified frame.
   """
   values = {
     s: brake_status_msg[s]
