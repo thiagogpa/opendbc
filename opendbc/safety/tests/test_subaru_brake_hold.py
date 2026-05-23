@@ -45,17 +45,18 @@ class TestSubaruBrakeIntercept(TestSubaruSafetyBase):
   SAFETY_MODEL = CarParams.SafetyModel.subaru
   FLAGS = 0  # gen1, no longitudinal
 
-  # base LKAS msgs + ES_Distance (no relay) + Brake_Pedal + ES_Brake + Brake_Status
+  # base LKAS msgs + ES_Distance (no relay) + ES_Brake + Brake_Status.
+  # No Brake_Pedal: openpilot never sends it in this no-SnG config, so the relay forwards the
+  # car's real Brake_Pedal (0x139) to Eyesight (stock). A leftover allowlist entry statically
+  # blocked that relay → Eyesight RX timeout → fault at power-on (hardware-confirmed 2026-05-22).
   TX_MSGS = (
     lkas_tx_msgs(SUBARU_MAIN_BUS)                           # ES_LKAS, ES_DashStatus, ES_LKAS_State, ES_Infotainment + ES_Distance
-    + [[MSG_SUBARU_Brake_Pedal,  SUBARU_CAM_BUS]]           # 0x139 cam bus
     + [[SubaruMsg.ES_Brake,      SUBARU_MAIN_BUS]]          # 0x220 main bus
     + [[MSG_SUBARU_Brake_Status, SUBARU_CAM_BUS]]           # 0x13C cam bus (masked copy, ES_Brake=0)
   )
 
   # Relay malfunction fires when received (addr,bus) matches a check_relay=true TX entry.
   # ES_Brake TX bus = MAIN_BUS → relay malfunction if ES_Brake seen on MAIN_BUS.
-  # Brake_Pedal TX bus = CAM_BUS → relay malfunction if Brake_Pedal seen on CAM_BUS.
   # Brake_Status TX bus = CAM_BUS → relay malfunction if Brake_Status seen on CAM_BUS.
   RELAY_MALFUNCTION_ADDRS = {
     SUBARU_MAIN_BUS: (
@@ -66,7 +67,6 @@ class TestSubaruBrakeIntercept(TestSubaruSafetyBase):
       SubaruMsg.ES_Brake,
     ),
     SUBARU_CAM_BUS: (
-      MSG_SUBARU_Brake_Pedal,
       MSG_SUBARU_Brake_Status,
     ),
   }
@@ -76,17 +76,14 @@ class TestSubaruBrakeIntercept(TestSubaruSafetyBase):
   # conditionally blocked via subaru_fwd_hook only while a hold is actively being injected).
   # FWD_BLACKLISTED_ADDRS keys = source bus (the bus the message ARRIVES from).
   # ES_Brake (0x220): conditionally blocked CAM→MAIN — covered by TestSubaruBrakeHoldFwd.
-  # Brake_Pedal (0x139): TX bus=CAM_BUS → blocked arriving from MAIN_BUS (src=MAIN, dst=CAM).
   # Brake_Status (0x13C): conditionally blocked MAIN→CAM — covered by TestSubaruBrakeHoldFwd.
+  # Brake_Pedal (0x139): NOT blocked — relay forwards the car's real frame MAIN→CAM to Eyesight (stock).
   FWD_BLACKLISTED_ADDRS = {
     SUBARU_CAM_BUS: [
       SubaruMsg.ES_LKAS,
       SubaruMsg.ES_DashStatus,
       SubaruMsg.ES_LKAS_State,
       SubaruMsg.ES_Infotainment,
-    ],
-    SUBARU_MAIN_BUS: [
-      MSG_SUBARU_Brake_Pedal,
     ],
   }
 
@@ -463,6 +460,24 @@ class TestSubaruBrakeIntercept(TestSubaruSafetyBase):
                      self.safety.safety_fwd_hook(SUBARU_CAM_BUS, SubaruMsg.ES_Brake),
                      "Eyesight AEB ES_Brake must reach braking module after hold release")
 
+  # ── Brake_Pedal relay must stay open (regression for the AVH/SnG-off Eyesight fault) ─────────
+
+  def test_fwd_brake_pedal_main_to_cam_forwarded(self):
+    """Regression: in the no-SnG config openpilot never sends Brake_Pedal, so it must NOT be
+    in the TX allowlist — the relay forwards the car's real Brake_Pedal (0x139) MAIN→CAM to
+    Eyesight. A leftover allowlist entry statically blocked it → Eyesight RX timeout → fault at
+    power-on whenever AVH was on and SnG off (hardware-confirmed 2026-05-22)."""
+    self.assertEqual(SUBARU_CAM_BUS,
+                     self.safety.safety_fwd_hook(SUBARU_MAIN_BUS, MSG_SUBARU_Brake_Pedal))
+
+  def test_fwd_brake_pedal_not_gated_during_hold(self):
+    """Invariant: subaru_fwd_hook never gates Brake_Pedal. Even while a hold is actively
+    injected, Brake_Pedal MAIN→CAM must keep forwarding to Eyesight (only ES_Brake/Brake_Status
+    are hold-gated)."""
+    self._tx_hold_pressure()
+    self.assertEqual(SUBARU_CAM_BUS,
+                     self.safety.safety_fwd_hook(SUBARU_MAIN_BUS, MSG_SUBARU_Brake_Pedal))
+
 
 class TestSubaruSnGBrakeIntercept(TestSubaruBrakeIntercept):
   """
@@ -565,6 +580,19 @@ class TestSubaruSnGBrakeIntercept(TestSubaruBrakeIntercept):
     self.safety.set_controls_allowed(True)
     self.assertFalse(self._tx(self._brake_status_msg(0)))
 
+  # ── Brake_Pedal asymmetry: SnG actively re-sends Brake_Pedal on the cam bus, so it IS in the
+  # allowlist and the relay is statically blocked MAIN→CAM (openpilot is the sender). Override the
+  # no-SnG regression/invariant, which expect the relay open. Guards the intentional asymmetry.
+
+  def test_fwd_brake_pedal_main_to_cam_forwarded(self):
+    """SnG sends Brake_Pedal on cam → in allowlist → relay statically blocked MAIN→CAM (-1)."""
+    self.assertEqual(-1, self.safety.safety_fwd_hook(SUBARU_MAIN_BUS, MSG_SUBARU_Brake_Pedal))
+
+  def test_fwd_brake_pedal_not_gated_during_hold(self):
+    """SnG: Brake_Pedal stays statically blocked MAIN→CAM during a hold too (negative control)."""
+    self._tx_hold_pressure()
+    self.assertEqual(-1, self.safety.safety_fwd_hook(SUBARU_MAIN_BUS, MSG_SUBARU_Brake_Pedal))
+
 
 class TestSubaruLongBrakeIntercept(TestSubaruBrakeIntercept):
   """
@@ -583,39 +611,36 @@ class TestSubaruLongBrakeIntercept(TestSubaruBrakeIntercept):
 
   # TX allowlist when subaru_longitudinal && subaru_brake_intercept (no SnG).
   # Must include: base LKAS + long common (ES_Distance, ES_Brake, ES_Status)
-  # + Brake_Status (cam, conditional fwd via disable_static_blocking)
-  # + Brake_Pedal (cam, kept for SnG-resume compat even when SnG not selected — harmless).
+  # + Brake_Status (cam, conditional fwd via disable_static_blocking).
+  # No Brake_Pedal: openpilot never sends it here, so the relay forwards the car's real
+  # Brake_Pedal to Eyesight (stock). The old leftover entry blocked it → fault (fixed 2026-05-22).
   TX_MSGS = (
     lkas_tx_msgs(SUBARU_MAIN_BUS)
     + [[SubaruMsg.ES_Brake,        SUBARU_MAIN_BUS]]
     + [[SubaruMsg.ES_Status,       SUBARU_MAIN_BUS]]
     + [[MSG_SUBARU_Brake_Status,   SUBARU_CAM_BUS]]
-    + [[MSG_SUBARU_Brake_Pedal,    SUBARU_CAM_BUS]]
   )
 
   # MAIN bus relay addrs: long mode adds ES_Distance + ES_Status (check_relay=true in
-  # SUBARU_COMMON_LONG_TX_MSGS). CAM bus adds Brake_Pedal (standalone entry with check_relay=true)
-  # and Brake_Status.
+  # SUBARU_COMMON_LONG_TX_MSGS). CAM bus has only Brake_Status (no Brake_Pedal — removed).
   RELAY_MALFUNCTION_ADDRS = {
     SUBARU_MAIN_BUS: (
       SubaruMsg.ES_LKAS, SubaruMsg.ES_DashStatus, SubaruMsg.ES_LKAS_State,
       SubaruMsg.ES_Infotainment, SubaruMsg.ES_Brake, SubaruMsg.ES_Distance, SubaruMsg.ES_Status,
     ),
     SUBARU_CAM_BUS: (
-      MSG_SUBARU_Brake_Pedal, MSG_SUBARU_Brake_Status,
+      MSG_SUBARU_Brake_Status,
     ),
   }
 
   # In long mode, ES_Brake + ES_Distance + ES_Status cam→main are ALL statically blocked
   # (SUBARU_COMMON_LONG_TX_MSGS uses check_relay=true for all three, no disable_static_blocking).
-  # Op long is the sole sender of these on main bus. Brake_Pedal (TX bus=CAM → block MAIN→CAM).
+  # Op long is the sole sender of these on main bus. Brake_Pedal is NOT blocked — the relay
+  # forwards the car's real frame MAIN→CAM to Eyesight (stock).
   FWD_BLACKLISTED_ADDRS = {
     SUBARU_CAM_BUS: [
       SubaruMsg.ES_LKAS, SubaruMsg.ES_DashStatus, SubaruMsg.ES_LKAS_State,
       SubaruMsg.ES_Infotainment, SubaruMsg.ES_Brake, SubaruMsg.ES_Distance, SubaruMsg.ES_Status,
-    ],
-    SUBARU_MAIN_BUS: [
-      MSG_SUBARU_Brake_Pedal,
     ],
   }
 
@@ -914,6 +939,19 @@ class TestSubaruLongSnGBrakeIntercept(TestSubaruLongBrakeIntercept):
                                   SubaruSafetyFlags.LONG | SubaruSafetyFlags.GEN2)
     self.safety.init_tests()
     self.assertFalse(self._tx(self._brake_status_msg(0)))
+
+  # ── Brake_Pedal asymmetry: SnG re-sends Brake_Pedal on cam → it IS in the allowlist →
+  # relay statically blocked MAIN→CAM. Override the no-SnG regression/invariant inherited
+  # from TestSubaruBrakeIntercept.
+
+  def test_fwd_brake_pedal_main_to_cam_forwarded(self):
+    """SnG sends Brake_Pedal on cam → in allowlist → relay statically blocked MAIN→CAM (-1)."""
+    self.assertEqual(-1, self.safety.safety_fwd_hook(SUBARU_MAIN_BUS, MSG_SUBARU_Brake_Pedal))
+
+  def test_fwd_brake_pedal_not_gated_during_hold(self):
+    """SnG: Brake_Pedal stays statically blocked MAIN→CAM during a hold too (negative control)."""
+    self._tx_hold_pressure()
+    self.assertEqual(-1, self.safety.safety_fwd_hook(SUBARU_MAIN_BUS, MSG_SUBARU_Brake_Pedal))
 
 
 if __name__ == "__main__":

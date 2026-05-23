@@ -305,12 +305,12 @@ static safety_config subaru_init(uint16_t param) {
   // Brake-intercept only (no SnG). ES_Brake/Brake_Status keep check_relay=true for malfunction
   // detection but use disable_static_blocking=true so the relay block lives in subaru_fwd_hook
   // (only during a hold), letting Eyesight's native ACC drive them when idle.
-  // Brake_Pedal is a leftover from the abandoned Brake_Pedal-injection approach (never sent by
-  // the brake-hold feature); retained pending hardware check that dropping it is safe.
+  // No Brake_Pedal: openpilot never sends it here, so leave the relay free to forward the car's
+  // real Brake_Pedal to Eyesight. Listing it statically blocked that relay → Eyesight RX timeout
+  // → fault whenever AVH was on and SnG off (hardware-confirmed harmful, removed 2026-05-22).
   static const CanMsg subaru_brake_intercept_tx_msgs[] = {
     SUBARU_BASE_TX_MSGS(SUBARU_MAIN_BUS, MSG_SUBARU_ES_LKAS)
     SUBARU_COMMON_TX_MSGS(SUBARU_MAIN_BUS)
-    {MSG_SUBARU_Brake_Pedal,  SUBARU_CAM_BUS,  8, .check_relay = true},
     {MSG_SUBARU_ES_Brake,     SUBARU_MAIN_BUS, 8, .check_relay = true, .disable_static_blocking = true},
     {MSG_SUBARU_Brake_Status, SUBARU_CAM_BUS,  8, .check_relay = true, .disable_static_blocking = true},
   };
@@ -326,11 +326,11 @@ static safety_config subaru_init(uint16_t param) {
 
   // alpha long + brake_intercept (no SnG). ES_Brake comes from SUBARU_COMMON_LONG_TX_MSGS with
   // static blocking on — op long owns the cam→main relay. Brake_Status uses conditional fwd_hook
-  // blocking. Brake_Pedal is the same abandoned-approach leftover noted above.
+  // blocking. No Brake_Pedal: openpilot never sends it here, so the relay forwards the car's real
+  // Brake_Pedal to Eyesight (same leftover removed from subaru_brake_intercept_tx_msgs above).
   static const CanMsg subaru_long_brake_intercept_tx_msgs[] = {
     SUBARU_BASE_TX_MSGS(SUBARU_MAIN_BUS, MSG_SUBARU_ES_LKAS)
     SUBARU_COMMON_LONG_TX_MSGS(SUBARU_MAIN_BUS)
-    {MSG_SUBARU_Brake_Pedal,  SUBARU_CAM_BUS, 8, .check_relay = true},
     {MSG_SUBARU_Brake_Status, SUBARU_CAM_BUS, 8, .check_relay = true, .disable_static_blocking = true},
   };
 
