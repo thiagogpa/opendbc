@@ -63,6 +63,8 @@ def make_CS(
   gear: GearShifter = GearShifter.drive,
   aeb_status: int = 0,
   es_brake_msg=None,
+  cruise_enabled: bool = False,
+  cruise_available: bool = False,
 ):
   CS = MagicMock()
   CS.out = MagicMock()
@@ -73,6 +75,9 @@ def make_CS(
   CS.out.gearShifter = gear
   CS.out.steeringTorque = 0
   CS.out.steeringRateDeg = 0
+  CS.out.cruiseState = MagicMock()
+  CS.out.cruiseState.enabled = cruise_enabled
+  CS.out.cruiseState.available = cruise_available
   CS.es_distance_msg = {"COUNTER": 0, "Cruise_Cancel": False, "Cruise_Throttle": 0,
                          "Close_Distance": 0.0}
   CS.es_dashstatus_msg = {}
@@ -667,3 +672,169 @@ class TestAlphaLongCoexistence:
       CS=make_CS(standstill=True, brakePressed=False, gasPressed=False),
     )
     assert not mock_bsh.called, "Brake_Status mask must not run when long is active"
+
+
+# ---------------------------------------------------------------------------
+# TestACCDeference
+#
+# AVH must never prime or hold while Eyesight ACC is engaged (cruiseState.enabled).
+# The fix (Task 2) adds CS.out.cruiseState.enabled guards to _update_brake_hold_state.
+# Tests 1-6, 9, 10 are RED until that guard is implemented; 7-8 are GREEN guards.
+# ---------------------------------------------------------------------------
+
+class TestACCDeference:
+
+  def test_no_prime_when_acc_enabled(self):
+    """ACC engaged during deceleration → priming must NOT occur.
+
+    frame=1 (odd): priming branch runs but frame%5≠0.
+    Without the guard the controller primes here → RED.
+    """
+    ctrl = make_ctrl()
+    ctrl.frame = 1
+    run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
+               CS=make_CS(vEgoRaw=0.5, brakePressed=True, cruise_enabled=True))
+    assert ctrl._brake_hold_primed is False
+
+  def test_no_prime_when_acc_enabled_rolling(self):
+    """Rolling but under 1.5 m/s threshold, ACC engaged → still no prime.
+
+    Same logic as test_no_prime_when_acc_enabled but confirms threshold boundary.
+    """
+    ctrl = make_ctrl()
+    ctrl.frame = 1
+    run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
+               CS=make_CS(vEgoRaw=1.2, brakePressed=True, cruise_enabled=True))
+    assert ctrl._brake_hold_primed is False
+
+  def test_no_hold_when_acc_enabled(self):
+    """Primed but ACC engages before standstill → create_es_brake_hold must NOT fire.
+
+    frame=0 (frame%5==0): hold branch runs.
+    Without the guard the controller sends hold → RED.
+    """
+    ctrl = make_ctrl()
+    ctrl.frame = 0
+    ctrl._brake_hold_primed = True
+    mock_bh = run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
+                         CS=make_CS(standstill=True, gasPressed=False, cruise_enabled=True))
+    assert not mock_bh.called
+
+  def test_release_when_acc_enabled(self):
+    """Primed while ACC is off, then ACC engages → latch must clear.
+
+    frame=1: prime (no ACC)
+    frame=5: ACC now on → _brake_hold_primed must be False after frame%5==0 reset.
+    Without the guard the latch stays set → RED.
+    """
+    ctrl = make_ctrl()
+
+    ctrl.frame = 1
+    run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
+               CS=make_CS(vEgoRaw=0.5, brakePressed=True, cruise_enabled=False))
+    assert ctrl._brake_hold_primed is True, "precondition: must be primed"
+
+    ctrl.frame = 5
+    run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
+               CS=make_CS(standstill=True, gasPressed=False, cruise_enabled=True))
+    assert ctrl._brake_hold_primed is False
+
+  def test_no_brake_status_mask_when_acc_enabled(self):
+    """Primed + active but ACC engaged → create_brake_status_hold must NOT fire.
+
+    Without the guard _brake_hold_active stays True and mask is sent → RED.
+    """
+    ctrl = make_ctrl()
+    ctrl.frame = 0
+    ctrl._brake_hold_primed = True
+    ctrl._brake_hold_active = True
+    mock_bh, mock_bsh = run_update_capture_both(
+      ctrl, CC_SP=make_CC_SP(mads_enabled=True),
+      CS=make_CS(standstill=True, gasPressed=False, cruise_enabled=True),
+    )
+    assert not mock_bsh.called
+
+  def test_mask_clears_when_acc_engages_midcadence(self):
+    """Mid-cadence frame (frame%2==0, frame%5≠0): ACC engaged → mask must not fire.
+
+    frame=2: _brake_hold_active carried over from prior frame%5==0 hold.
+    With ACC now on the mask send must be suppressed, clearing the active flag.
+    Without the guard the carried-over active flag still triggers the mask → RED.
+    """
+    ctrl = make_ctrl()
+    ctrl._brake_hold_primed = True
+    ctrl._brake_hold_active = True
+    ctrl.frame = 2  # 2%5 != 0 (no state recompute) but 2%2 == 0 (mask cadence)
+    mock_bh, mock_bsh = run_update_capture_both(
+      ctrl, CC_SP=make_CC_SP(mads_enabled=True),
+      CS=make_CS(standstill=True, gasPressed=False, aeb_status=0, cruise_enabled=True),
+    )
+    assert not mock_bsh.called
+
+  def test_acc_available_but_not_enabled_still_holds(self):
+    """ACC main-on (available) but not engaged → AVH must still hold.
+
+    The guard gates only on .enabled, not .available.
+    This should pass GREEN even before the fix.
+    """
+    ctrl = make_ctrl()
+    ctrl.frame = 0
+    ctrl._brake_hold_primed = True
+    mock_bh = run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
+                         CS=make_CS(standstill=True, gasPressed=False,
+                                    cruise_available=True, cruise_enabled=False))
+    assert mock_bh.called
+    assert mock_bh.call_args[0][4] == CarControllerParams.BRAKE_HOLD_PRESSURE
+
+  def test_aeb_echo_unaffected_by_acc(self):
+    """AEB active, ACC also engaged → AEB echo must still fire.
+
+    AEB authority is independent of ACC engagement.
+    This should pass GREEN even before the fix.
+    """
+    ctrl = make_ctrl()
+    ctrl.frame = 0
+    ctrl._brake_hold_primed = False
+    aeb_msg = {
+      "AEB_Status": 4, "CHECKSUM": 0, "Signal1": 0, "Brake_Pressure": 600,
+      "Cruise_Brake_Lights": 1, "Cruise_Brake_Fault": 0, "Cruise_Brake_Active": 1,
+      "Cruise_Activated": 0, "Signal3": 0,
+    }
+    mock_bh = run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
+                         CS=make_CS(standstill=False, vEgoRaw=8.0, brakePressed=False,
+                                    gasPressed=False, es_brake_msg=aeb_msg, cruise_enabled=True))
+    assert mock_bh.called
+    assert mock_bh.call_args[0][4] == 600
+
+  def test_no_hold_when_acc_enabled_alpha_long(self):
+    """Alpha-long branch: ACC engaged → create_es_brake_hold must NOT fire.
+
+    Uses _run_long_branch (long_control=True). Without the guard hold still fires → RED.
+    """
+    ctrl = make_ctrl(long_control=True)
+    ctrl.frame = 0
+    ctrl._brake_hold_primed = True
+    CC = make_CC(enabled=False, long_active=False)
+    mock_eb, mock_bh, _ = _run_long_branch(
+      ctrl, CC,
+      CC_SP=make_CC_SP(mads_enabled=True),
+      CS=make_CS(standstill=True, brakePressed=False, gasPressed=False, cruise_enabled=True),
+    )
+    assert not mock_bh.called
+
+  def test_real_packer_no_es_brake_when_acc_enabled(self):
+    """Real CANPacker: ACC engaged, primed=True → no ES_Brake frame at 0x220.
+
+    Does not patch create_es_brake_hold. Without the guard a hold frame is emitted → RED.
+    """
+    ctrl = make_ctrl()
+    ctrl.frame = 0
+    ctrl._brake_hold_primed = True
+    with _STEERING_PATCH, _DASHSTATUS_PATCH, _LKAS_STATE_PATCH, \
+         patch(_BRAKE_STATUS_HOLD_PATCH, return_value=_DUMMY_BS_MSG):
+      _, can_sends = ctrl.update(
+        make_CC(), make_CC_SP(mads_enabled=True),
+        make_CS(standstill=True, brakePressed=False, gasPressed=False, cruise_enabled=True), 0,
+      )
+    es_brake_frames = [m for m in can_sends if isinstance(m[0], int) and m[0] == 0x220]
+    assert len(es_brake_frames) == 0, "no ES_Brake frame must be emitted when ACC is engaged"

@@ -39,19 +39,22 @@ class CarController(CarControllerBase, SnGCarController):
 
     # Velocity-primed latch: capture hold intent during deceleration before mads.active
     # drops at ~0.18 m/s.
-    if CC_SP.mads.enabled and CS.out.vEgoRaw < 1.5 and CS.out.brakePressed:
+    if CC_SP.mads.enabled and CS.out.vEgoRaw < 1.5 and CS.out.brakePressed and not CS.out.cruiseState.enabled:
       if CS.out.gearShifter not in (GearShifter.park, GearShifter.reverse):
         self._brake_hold_primed = True
 
     if self.frame % 5 != 0:
+      if CS.out.cruiseState.enabled and CS.es_brake_msg["AEB_Status"] == 0:
+        self._brake_hold_active = False
       return None, self._brake_hold_active
 
     holding = (self._brake_hold_primed
                and CS.out.standstill
                and not CS.out.gasPressed
+               and not CS.out.cruiseState.enabled
                and CS.out.gearShifter not in (GearShifter.park, GearShifter.reverse))
 
-    if CS.out.gasPressed or not CC_SP.mads.enabled or CS.out.vEgoRaw > 0.5:
+    if CS.out.gasPressed or not CC_SP.mads.enabled or CS.out.vEgoRaw > 0.5 or CS.out.cruiseState.enabled:
       self._brake_hold_primed = False
 
     aeb_active = CS.es_brake_msg["AEB_Status"] != 0
