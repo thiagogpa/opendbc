@@ -29,7 +29,7 @@ class CarController(CarControllerBase, SnGCarController):
     self.p = CarControllerParams(CP)
     self.packer = CANPacker(DBC[CP.carFingerprint][Bus.pt])
 
-  def _update_brake_hold_state(self, CC, CC_SP, CS):
+  def _update_brake_hold_state(self, CC_SP, CS):
     """Velocity-primed brake-hold latch: primes during deceleration before mads.active
     drops, holds at standstill, releases on gas / mads-off / speed. Pure w.r.t.
     long-control flags — the caller arbitrates whether to send the ES_Brake message.
@@ -150,7 +150,7 @@ class CarController(CarControllerBase, SnGCarController):
         if self.CP.flags & SubaruFlags.SEND_INFOTAINMENT:
           can_sends.append(subarucan.create_es_infotainment(self.packer, self.frame // 10, CS.es_infotainment_msg, hud_control.visualAlert))
 
-      brake_hold_value, brake_hold_active = self._update_brake_hold_state(CC, CC_SP, CS)
+      brake_hold_value, brake_hold_active = self._update_brake_hold_state(CC_SP, CS)
       avh_owns_es_brake = brake_hold_value is not None and not CC.longActive
 
       if self.CP.openpilotLongitudinalControl:
