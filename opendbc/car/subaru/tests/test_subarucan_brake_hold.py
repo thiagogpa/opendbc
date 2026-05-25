@@ -4,6 +4,7 @@ from opendbc.can import CANPacker
 from opendbc.car import Bus
 from opendbc.car.subaru.values import DBC, CAR, CanBus
 from opendbc.car.subaru import subarucan
+from opendbc.sunnypilot.car.subaru import subarucan_ext
 
 
 def make_packer():
@@ -122,3 +123,25 @@ def test_real_packer_accepts_signals():
   assert addr == 0x220
   assert bus == CanBus.main
   assert len(dat) == 8
+
+
+# --- Brake_Status ES_Brake bit must stay at byte 7 bit 2 (panda reads `(data[7] >> 2) & 1`) ---
+
+def make_brake_status_msg(**overrides):
+  base = {"CHECKSUM": 0, "COUNTER": 0, "Signal1": 0, "ES_Brake": 0, "Signal2": 0, "Brake": 0, "Signal3": 0}
+  base.update(overrides)
+  return base
+
+
+def test_brake_status_es_brake_bit_offset_matches_safety():
+  # Pin the DBC ES_Brake location to the hardcoded panda offset; a DBC move would silently
+  # desync subaru_tx_hook's Brake_Status check from create_brake_status_hold's packing.
+  packer = CANPacker(DBC[CAR.SUBARU_IMPREZA_2020.value][Bus.pt])
+  _, dat_set, _ = packer.make_can_msg("Brake_Status", CanBus.camera, make_brake_status_msg(ES_Brake=1))
+  assert dat_set[7] == 0x04  # only ES_Brake set -> byte 7 bit 2
+
+  # the hold mask clears that exact bit while forwarding Brake (bit 6)
+  _, dat_hold, bus = subarucan_ext.create_brake_status_hold(packer, make_brake_status_msg(ES_Brake=1, Brake=1))
+  assert (dat_hold[7] >> 2) & 1 == 0
+  assert (dat_hold[7] >> 6) & 1 == 1
+  assert bus == CanBus.camera
