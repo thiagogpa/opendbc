@@ -396,10 +396,10 @@ static safety_config subaru_init(uint16_t param) {
 static bool subaru_fwd_hook(int bus_num, int addr) {
   bool block = false;
   if (subaru_brake_intercept && (subaru_brake_hold_active_countdown > 0)) {
-    if ((bus_num == SUBARU_CAM_BUS) && (addr == MSG_SUBARU_ES_Brake)) {
+    if (((uint32_t)bus_num == SUBARU_CAM_BUS) && ((uint32_t)addr == MSG_SUBARU_ES_Brake)) {
       block = true;  // hide Eyesight's ES_Brake from braking module during hold
     }
-    if ((bus_num == SUBARU_MAIN_BUS) && (addr == MSG_SUBARU_Brake_Status)) {
+    if (((uint32_t)bus_num == SUBARU_MAIN_BUS) && ((uint32_t)addr == MSG_SUBARU_Brake_Status)) {
       block = true;  // hide braking module's hold-induced ES_Brake bit from Eyesight
     }
   }

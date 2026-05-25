@@ -339,7 +339,7 @@ class TestACCInterferenceRegression(unittest.TestCase):
     self.assertTrue(mock_bsh.called)
 
   def test_brake_hold_active_tracks_state(self):
-    # _brake_hold_active must be True iff (holding or AEB)
+    # _brake_hold_active must be True if and only if (holding or AEB)
     ctrl = make_ctrl()
     ctrl.frame = 0
 
