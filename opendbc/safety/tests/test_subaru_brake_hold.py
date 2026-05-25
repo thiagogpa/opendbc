@@ -1,16 +1,8 @@
 #!/usr/bin/env python3
-"""
-Panda safety tests for the Subaru brake-intercept feature.
+"""Panda safety tests for the Subaru brake-intercept feature.
 
-Settling-window counter mechanics (rx_hook counts UP):
-  standstill → countdown = 0 (reset on each zero-speed frame)
-  moving frame 1 → countdown = 1  (1 < 3 → settling)
-  moving frame 2 → countdown = 2  (2 < 3 → settling)
-  moving frame 3 → countdown = 3  (3 < 3 → FALSE → BLOCKED)
-  moving frame 4+ → countdown = 3 (capped, still blocked)
-
-tx_hook settling check:  standstill_or_settling = !vehicle_moving || (countdown < BRAKE_INTERCEPT_RELEASE_FRAMES)
-                          i.e.  countdown < 3  (NOT countdown > 0)
+Settling window: tx of non-zero ES_Brake is allowed while the rx countdown is
+< BRAKE_INTERCEPT_RELEASE_FRAMES (3), i.e. for the first 2 moving Wheel_Speeds frames.
 """
 import unittest
 
@@ -20,7 +12,6 @@ from opendbc.safety.tests.libsafety import libsafety_py
 from opendbc.safety.tests.common import CANPackerSafety
 from opendbc.sunnypilot.car.subaru.values_ext import SubaruSafetyFlagsSP
 
-# Re-use constants / helpers from the upstream test module
 from opendbc.safety.tests.test_subaru import (
   SubaruMsg,
   SUBARU_MAIN_BUS,
@@ -29,35 +20,29 @@ from opendbc.safety.tests.test_subaru import (
   TestSubaruSafetyBase,
 )
 
-# Brake_Pedal (0x139) and Brake_Status (0x13C) are not in SubaruMsg enum — define locally
+# Brake_Pedal (0x139) and Brake_Status (0x13C) are not in the SubaruMsg enum
 MSG_SUBARU_Brake_Pedal  = 0x139
 MSG_SUBARU_Brake_Status = 0x13C
 
 BRAKE_INTERCEPT_RELEASE_FRAMES = 3  # must match C #define
-SUBARU_BRAKE_HOLD_ACTIVE_FRAMES = 4  # must match C #define (~80ms at 50Hz Wheel_Speeds, 1 frame = 20ms)
+SUBARU_BRAKE_HOLD_ACTIVE_FRAMES = 4  # must match C #define (~80ms at 50Hz Wheel_Speeds)
 
 
 class TestSubaruBrakeIntercept(TestSubaruSafetyBase):
-  """
-  Gen1, no SnG, brake_intercept SP param set.
-  TX allowlist: base LKAS + ES_Distance (no relay) + Brake_Pedal (cam, relay) + ES_Brake (main, relay).
-  """
+  # Gen1, no SnG, brake_intercept SP param set.
   SAFETY_MODEL = CarParams.SafetyModel.subaru
-  FLAGS = 0  # gen1, no longitudinal
+  FLAGS = 0
+  SP_PARAM = SubaruSafetyFlagsSP.BRAKE_INTERCEPT
 
-  # base LKAS msgs + ES_Distance (no relay) + ES_Brake + Brake_Status.
-  # No Brake_Pedal: openpilot never sends it in this no-SnG config, so the relay forwards the
-  # car's real Brake_Pedal (0x139) to Eyesight (stock). A leftover allowlist entry statically
-  # blocked that relay → Eyesight RX timeout → fault at power-on (hardware-confirmed 2026-05-22).
+  # No Brake_Pedal: openpilot never sends it in this no-SnG config, so the relay must forward the
+  # car's real Brake_Pedal (0x139) to Eyesight. A leftover allowlist entry statically blocked that
+  # relay → Eyesight RX timeout → fault at power-on (hardware-confirmed 2026-05-22).
   TX_MSGS = (
-    lkas_tx_msgs(SUBARU_MAIN_BUS)                           # ES_LKAS, ES_DashStatus, ES_LKAS_State, ES_Infotainment + ES_Distance
-    + [[SubaruMsg.ES_Brake,      SUBARU_MAIN_BUS]]          # 0x220 main bus
-    + [[MSG_SUBARU_Brake_Status, SUBARU_CAM_BUS]]           # 0x13C cam bus (masked copy, ES_Brake=0)
+    lkas_tx_msgs(SUBARU_MAIN_BUS)
+    + [[SubaruMsg.ES_Brake,      SUBARU_MAIN_BUS]]
+    + [[MSG_SUBARU_Brake_Status, SUBARU_CAM_BUS]]
   )
 
-  # Relay malfunction fires when received (addr,bus) matches a check_relay=true TX entry.
-  # ES_Brake TX bus = MAIN_BUS → relay malfunction if ES_Brake seen on MAIN_BUS.
-  # Brake_Status TX bus = CAM_BUS → relay malfunction if Brake_Status seen on CAM_BUS.
   RELAY_MALFUNCTION_ADDRS = {
     SUBARU_MAIN_BUS: (
       SubaruMsg.ES_LKAS,
@@ -71,13 +56,8 @@ class TestSubaruBrakeIntercept(TestSubaruSafetyBase):
     ),
   }
 
-  # Forwarding block logic: check_relay=true entry with bus=destination_bus → fwd returns -1
-  # UNLESS disable_static_blocking=true (see ES_Brake & Brake_Status below — those are
-  # conditionally blocked via subaru_fwd_hook only while a hold is actively being injected).
-  # FWD_BLACKLISTED_ADDRS keys = source bus (the bus the message ARRIVES from).
-  # ES_Brake (0x220): conditionally blocked CAM→MAIN — covered by TestSubaruBrakeHoldFwd.
-  # Brake_Status (0x13C): conditionally blocked MAIN→CAM — covered by TestSubaruBrakeHoldFwd.
-  # Brake_Pedal (0x139): NOT blocked — relay forwards the car's real frame MAIN→CAM to Eyesight (stock).
+  # ES_Brake (CAM→MAIN) and Brake_Status (MAIN→CAM) are conditionally blocked only while a hold is
+  # actively injected (see TestSubaruBrakeHoldFwd); Brake_Pedal is never blocked.
   FWD_BLACKLISTED_ADDRS = {
     SUBARU_CAM_BUS: [
       SubaruMsg.ES_LKAS,
@@ -90,47 +70,35 @@ class TestSubaruBrakeIntercept(TestSubaruSafetyBase):
   def setUp(self):
     self.packer = CANPackerSafety("subaru_global_2017_generated")
     self.safety = libsafety_py.libsafety
-    # CRITICAL: SP param must be set BEFORE set_safety_hooks
-    self.safety.set_current_safety_param_sp(SubaruSafetyFlagsSP.BRAKE_INTERCEPT)
+    self.safety.set_current_safety_param_sp(self.SP_PARAM)  # must precede set_safety_hooks
     self.safety.set_safety_hooks(CarParams.SafetyModel.subaru, self.FLAGS)
     self.safety.init_tests()
 
   # ── helpers ────────────────────────────────────────────────────────────────
 
+  def _engage(self):
+    # standard engagement: ACC. Long subclass overrides to MADS-only.
+    self.safety.set_controls_allowed(True)
+
   def _es_brake_msg(self, pressure):
-    values = {"Brake_Pressure": pressure}
-    return self.packer.make_can_msg_safety("ES_Brake", SUBARU_MAIN_BUS, values)
+    return self.packer.make_can_msg_safety("ES_Brake", SUBARU_MAIN_BUS, {"Brake_Pressure": pressure})
 
   def _set_standstill(self):
-    """Drive rx_hook to vehicle_moving=False and reset countdown."""
     for _ in range(BRAKE_INTERCEPT_RELEASE_FRAMES + 1):
       self._rx(self._speed_msg(0))
 
   def _set_moving(self, frames=1):
-    """Drive rx_hook to vehicle_moving=True for `frames` Wheel_Speeds frames."""
     for _ in range(frames):
-      self._rx(self._speed_msg(10))  # non-zero speed
+      self._rx(self._speed_msg(10))
 
   def _exhaust_hysteresis(self):
-    """Send enough moving frames to push countdown to BRAKE_INTERCEPT_RELEASE_FRAMES (blocked)."""
     self._set_moving(frames=BRAKE_INTERCEPT_RELEASE_FRAMES + 1)
 
-  # ── TX allowlist sanity ─────────────────────────────────────────────────────
-
-  def test_brake_intercept_tx_msgs_includes_es_brake(self):
-    """ES_Brake on main bus must be in TX_MSGS class attribute."""
-    self.assertIn([SubaruMsg.ES_Brake, SUBARU_MAIN_BUS], self.TX_MSGS)
-
   def test_tx_hook_on_wrong_safety_mode(self):
-    """
-    Override to skip cross-class overlap check between TestSubaruBrakeIntercept
-    and TestSubaruSnGBrakeIntercept — they share all LKAS TX msgs by design.
-    The inherited test_spam_can_buses and test_tx_msg_in_scanned_range provide
-    equivalent per-mode coverage without false cross-class collisions.
-    """
-    raise unittest.SkipTest("Subaru brake-intercept variants share LKAS TX msgs — skip cross-mode TX check")
+    # brake-intercept variants share all LKAS TX msgs by design — skip the cross-class overlap check
+    raise unittest.SkipTest("Subaru brake-intercept variants share LKAS TX msgs")
 
-  # ── zero pressure always allowed ────────────────────────────────────────────
+  # ── zero pressure always allowed (passthrough) ──────────────────────────────
 
   def test_es_brake_zero_allowed_at_standstill(self):
     self._set_standstill()
@@ -138,130 +106,77 @@ class TestSubaruBrakeIntercept(TestSubaruSafetyBase):
     self.assertTrue(self._tx(self._es_brake_msg(0)))
 
   def test_es_brake_zero_allowed_when_moving(self):
-    """Zero pressure is a passthrough — always TX even when fully moving."""
     self._exhaust_hysteresis()
     self.safety.set_controls_allowed(True)
     self.assertTrue(self._tx(self._es_brake_msg(0)))
 
   def test_es_brake_zero_allowed_when_moving_controls_off(self):
-    """Zero pressure passes even with controls_allowed=False."""
     self._exhaust_hysteresis()
     self.safety.set_controls_allowed(False)
     self.assertTrue(self._tx(self._es_brake_msg(0)))
 
-  # ── non-zero pressure at standstill ─────────────────────────────────────────
+  # ── non-zero pressure at standstill: pressure × authority matrix ─────────────
 
-  def test_es_brake_nonzero_allowed_at_standstill(self):
-    self._set_standstill()
-    self.safety.set_controls_allowed(True)
-    self.assertTrue(self._tx(self._es_brake_msg(100)))
-
-  def test_es_brake_at_max_allowed_at_standstill(self):
-    """Boundary: pressure == max_brake (600) at standstill is allowed."""
-    self._set_standstill()
-    self.safety.set_controls_allowed(True)
-    self.assertTrue(self._tx(self._es_brake_msg(600)))
-
-  def test_es_brake_exceeds_max_blocked_at_standstill(self):
-    """pressure = 601 > max_brake → violation regardless of standstill."""
-    self._set_standstill()
-    self.safety.set_controls_allowed(True)
-    self.assertFalse(self._tx(self._es_brake_msg(601)))
-
-  def test_es_brake_requires_controls_allowed_at_standstill(self):
-    """Non-zero pressure blocked only when BOTH controls_allowed and controls_allowed_lateral are False."""
-    self._set_standstill()
-    self.safety.set_controls_allowed(False)
-    self.safety.set_controls_allowed_lateral(False)
-    self.assertFalse(self._tx(self._es_brake_msg(100)))
-
-  def test_es_brake_allowed_with_mads_only_at_standstill(self):
-    """controls_allowed=False but controls_allowed_lateral=True (MADS active, no ACC) → allowed."""
-    self._set_standstill()
-    self.safety.set_controls_allowed(False)
-    self.safety.set_controls_allowed_lateral(True)
-    self.assertTrue(self._tx(self._es_brake_msg(100)))
+  def test_standstill_pressure_authority(self):
+    # (pressure, controls_allowed, controls_lateral, expected) — blocked only when BOTH authorities
+    # are off or pressure exceeds max_brake (600)
+    for pressure, controls, lateral, allowed in [
+      (100, True, False, True),
+      (600, True, False, True),   # boundary == max_brake
+      (601, True, False, False),  # > max_brake
+      (100, False, False, False),  # neither ACC nor MADS
+      (100, False, True, True),   # MADS-only
+    ]:
+      with self.subTest(pressure=pressure, controls=controls, lateral=lateral):
+        self._set_standstill()
+        self.safety.set_controls_allowed(controls)
+        self.safety.set_controls_allowed_lateral(lateral)
+        self.assertEqual(allowed, self._tx(self._es_brake_msg(pressure)))
 
   def test_es_brake_allowed_with_gas_pressed_at_standstill(self):
-    """Gas is intentionally NOT gated on the AVH path: an injected hold at standstill is allowed
-    even with the gas pressed. This is deliberate — the controller owns the gas-release UX, the
-    same ES_Brake frame carries Eyesight's AEB echo (which must never be gas-gated), and braking
-    is the fail-safe direction (already bounded by authority + pressure + standstill)."""
+    # gas is intentionally NOT gated on the AVH path: the same ES_Brake frame carries Eyesight's AEB
+    # echo (must never be gas-gated) and braking is the fail-safe direction
     self._set_standstill()
     self.safety.set_controls_allowed(False)
     self.safety.set_controls_allowed_lateral(True)
-    self._rx(self._user_gas_msg(2000))  # driver on the gas
+    self._rx(self._user_gas_msg(2000))
     self.assertTrue(self._tx(self._es_brake_msg(600)))
 
-  # ── non-zero pressure when moving (hysteresis exhausted) ────────────────────
+  # ── non-zero pressure when moving (hysteresis / settling window) ─────────────
 
   def test_es_brake_nonzero_blocked_when_moving(self):
-    """After hysteresis expires, non-zero pressure must be blocked."""
     self._set_standstill()
-    self.safety.set_controls_allowed(True)
+    self._engage()
     self._exhaust_hysteresis()
     self.assertFalse(self._tx(self._es_brake_msg(100)))
 
   def test_es_brake_nonzero_blocked_when_moving_various_pressures(self):
-    """Several pressure values all blocked once fully moving."""
     self._set_standstill()
-    self.safety.set_controls_allowed(True)
+    self._engage()
     self._exhaust_hysteresis()
     for pressure in (1, 50, 100, 300, 600):
       with self.subTest(pressure=pressure):
         self.assertFalse(self._tx(self._es_brake_msg(pressure)))
 
-  # ── settling-window hysteresis ───────────────────────────────────────────────
-
-  def test_race_a_allowed_during_hysteresis_frame1(self):
-    """
-    Exactly 1 moving frame received → countdown=1 < 3 → settling → ALLOWED.
-    Models the first Wheel_Speeds frame where panda sees vehicle_moving=True
-    but Python has not yet updated CS.out.standstill.
-    """
-    self._set_standstill()
-    self.safety.set_controls_allowed(True)
-    self._set_moving(frames=1)
-    self.assertTrue(self._tx(self._es_brake_msg(100)))
-
-  def test_race_a_allowed_during_hysteresis_frame2(self):
-    """2 moving frames → countdown=2 < 3 → still settling → ALLOWED."""
-    self._set_standstill()
-    self.safety.set_controls_allowed(True)
-    self._set_moving(frames=2)
-    self.assertTrue(self._tx(self._es_brake_msg(100)))
-
-  def test_race_a_blocked_at_frame3(self):
-    """
-    Exactly BRAKE_INTERCEPT_RELEASE_FRAMES (3) moving frames → countdown=3.
-    3 < 3 is False → not settling → BLOCKED.
-    """
-    self._set_standstill()
-    self.safety.set_controls_allowed(True)
-    self._set_moving(frames=BRAKE_INTERCEPT_RELEASE_FRAMES)
-    self.assertFalse(self._tx(self._es_brake_msg(100)))
-
-  def test_race_a_blocked_after_hysteresis_frame4plus(self):
-    """4+ frames — countdown capped at 3, still blocked."""
-    self._set_standstill()
-    self.safety.set_controls_allowed(True)
-    self._exhaust_hysteresis()  # BRAKE_INTERCEPT_RELEASE_FRAMES + 1 = 4 frames
-    self.assertFalse(self._tx(self._es_brake_msg(100)))
+  def test_settling_window_frame_gating(self):
+    # countdown < BRAKE_INTERCEPT_RELEASE_FRAMES (3) → settling → allowed; capped at 3 once moving
+    for frames, allowed in [(1, True), (2, True), (BRAKE_INTERCEPT_RELEASE_FRAMES, False),
+                            (BRAKE_INTERCEPT_RELEASE_FRAMES + 1, False)]:
+      with self.subTest(frames=frames):
+        self._set_standstill()
+        self._engage()
+        self._set_moving(frames=frames)
+        self.assertEqual(allowed, self._tx(self._es_brake_msg(100)))
 
   def test_race_a_countdown_resets_on_standstill(self):
-    """After hysteresis expires, returning to standstill re-allows non-zero pressure."""
     self._set_standstill()
-    self.safety.set_controls_allowed(True)
+    self._engage()
     self._exhaust_hysteresis()
-    # Now blocked
     self.assertFalse(self._tx(self._es_brake_msg(100)))
-    # Return to standstill → countdown reset to 0
-    self._set_standstill()
-    # Should be allowed again
+    self._set_standstill()  # countdown reset → allowed again
     self.assertTrue(self._tx(self._es_brake_msg(100)))
 
   def test_race_a_hysteresis_does_not_bypass_controls_allowed(self):
-    """Even inside the settling window, both controls_allowed=False AND controls_allowed_lateral=False blocks non-zero."""
     self._set_standstill()
     self.safety.set_controls_allowed(False)
     self.safety.set_controls_allowed_lateral(False)
@@ -269,7 +184,6 @@ class TestSubaruBrakeIntercept(TestSubaruSafetyBase):
     self.assertFalse(self._tx(self._es_brake_msg(100)))
 
   def test_race_a_hysteresis_does_not_bypass_max_brake(self):
-    """Pressure > max_brake blocked even inside settling window."""
     self._set_standstill()
     self.safety.set_controls_allowed(True)
     self._set_moving(frames=1)  # inside settling window
@@ -278,57 +192,41 @@ class TestSubaruBrakeIntercept(TestSubaruSafetyBase):
   # ── Brake_Status (0x13C) masking tx_hook ────────────────────────────────────
 
   def _brake_status_msg(self, es_brake_bit):
-    """Build a Brake_Status CAN message with the ES_Brake bit set or cleared.
-    ES_Brake is bit 2 of byte 7 (bit 58 overall) per subaru_global_2017_generated.dbc."""
-    # The packer doesn't expose a named ES_Brake signal in Brake_Status directly via
-    # the safety packer, so build the raw byte manually.
-    values = {"ES_Brake": es_brake_bit, "Brake": 0}
-    return self.packer.make_can_msg_safety("Brake_Status", SUBARU_CAM_BUS, values)
+    return self.packer.make_can_msg_safety("Brake_Status", SUBARU_CAM_BUS, {"ES_Brake": es_brake_bit, "Brake": 0})
 
   def test_brake_status_allowed_es_brake_cleared(self):
-    """Brake_Status with ES_Brake=0 to cam bus must be allowed in brake_intercept mode."""
     self.safety.set_controls_allowed(True)
     self.assertTrue(self._tx(self._brake_status_msg(0)))
 
   def test_brake_status_blocked_es_brake_set(self):
-    """Brake_Status with ES_Brake=1 must be blocked — panda must never forward this to Eyesight."""
+    # panda must never forward a Brake_Status with ES_Brake=1 to Eyesight
     self.safety.set_controls_allowed(True)
     self.assertFalse(self._tx(self._brake_status_msg(1)))
 
   def test_brake_status_allowed_controls_off(self):
-    """Brake_Status masking is not gated on controls_allowed — always needed during hold."""
+    # masking is not gated on controls_allowed — always needed during hold
     self.safety.set_controls_allowed(False)
     self.assertTrue(self._tx(self._brake_status_msg(0)))
 
   def test_brake_status_blocked_without_brake_intercept(self):
-    """In non-brake_intercept mode, Brake_Status is not in TX allowlist → blocked."""
-    self.safety.set_current_safety_param_sp(0)  # no SP flags
+    self.safety.set_current_safety_param_sp(0)
     self.safety.set_safety_hooks(CarParams.SafetyModel.subaru, 0)
     self.safety.init_tests()
     self.safety.set_controls_allowed(True)
     self.assertFalse(self._tx(self._brake_status_msg(0)))
 
-  # ── brake_intercept absent → ES_Brake not in allowlist ──────────────────────
-
   def test_no_brake_intercept_es_brake_blocked(self):
-    """
-    Re-init with NO brake_intercept SP param.
-    ES_Brake is not in TX allowlist → tx blocked unconditionally.
-    """
-    self.safety.set_current_safety_param_sp(0)  # no SP flags
+    # no brake_intercept SP param → ES_Brake not in allowlist → blocked unconditionally
+    self.safety.set_current_safety_param_sp(0)
     self.safety.set_safety_hooks(CarParams.SafetyModel.subaru, 0)
     self.safety.init_tests()
     self._set_standstill()
     self.safety.set_controls_allowed(True)
-    self.assertFalse(self._tx(self._es_brake_msg(0)))    # even zero blocked (not in allowlist)
+    self.assertFalse(self._tx(self._es_brake_msg(0)))
     self.assertFalse(self._tx(self._es_brake_msg(100)))
 
-  # ── gen2 never gets brake_intercept ─────────────────────────────────────────
-
   def test_gen2_with_brake_intercept_sp_param_es_brake_blocked(self):
-    """
-    Gen2 flag ignores SP brake_intercept — ES_Brake must not be in TX allowlist.
-    """
+    # gen2 ignores SP brake_intercept — ES_Brake must not be in the allowlist
     self.safety.set_current_safety_param_sp(SubaruSafetyFlagsSP.BRAKE_INTERCEPT)
     self.safety.set_safety_hooks(CarParams.SafetyModel.subaru, SubaruSafetyFlags.GEN2)
     self.safety.init_tests()
@@ -338,64 +236,45 @@ class TestSubaruBrakeIntercept(TestSubaruSafetyBase):
     self.assertFalse(self._tx(self._es_brake_msg(100)))
 
   # ── Conditional forwarding ───────────────────────────────────────────────────
-  #
-  # In brake-intercept mode, ES_Brake (CAM→MAIN) and Brake_Status (MAIN→CAM) forwarding is
-  # blocked only while openpilot is actively asserting a hold — not unconditionally.
-  # Unconditional blocking would break Eyesight's native ACC braking: Eyesight's ES_Brake
-  # would never reach the braking module, and the module's Brake_Status (ES_Brake=1
-  # confirmation) would never reach Eyesight → Cruise_Fault watchdog within ~566ms.
-  # The active-hold state is tracked via a Wheel_Speeds-paced countdown set on TX of
-  # ES_Brake (Brake_Pressure>0) or Brake_Status (the mask).
+  # ES_Brake (CAM→MAIN) and Brake_Status (MAIN→CAM) are blocked only while a hold is actively
+  # injected. Unconditional blocking would starve Eyesight's native ACC braking and trip its
+  # ~566ms Cruise_Fault watchdog. Active-hold state is a Wheel_Speeds-paced countdown set on TX.
 
   def _brake_status_mask_msg(self):
-    return self.packer.make_can_msg_safety("Brake_Status", SUBARU_CAM_BUS,
-                                           {"ES_Brake": 0, "Brake": 0})
+    return self.packer.make_can_msg_safety("Brake_Status", SUBARU_CAM_BUS, {"ES_Brake": 0, "Brake": 0})
 
   def _tx_hold_pressure(self):
-    """TX one ES_Brake with Brake_Pressure>0 — should set the active-hold countdown."""
     self._set_standstill()
     self.safety.set_controls_allowed(True)
     self.assertTrue(self._tx(self._es_brake_msg(400)))
 
   def _tx_brake_status_mask(self):
-    """TX the masked Brake_Status — should also set the active-hold countdown."""
     self.safety.set_controls_allowed(True)
     self.assertTrue(self._tx(self._brake_status_mask_msg()))
 
   def _pump_wheel_speeds(self, n):
-    """Advance the countdown by n Wheel_Speeds RX frames."""
     for _ in range(n):
       self._rx(self._speed_msg(0))
 
   def test_fwd_es_brake_cam_to_main_allowed_when_idle(self):
-    """At setUp (no hold TX yet) — ES_Brake CAM→MAIN must forward (destination 0)."""
-    self.assertEqual(SUBARU_MAIN_BUS,
-                     self.safety.safety_fwd_hook(SUBARU_CAM_BUS, SubaruMsg.ES_Brake))
+    self.assertEqual(SUBARU_MAIN_BUS, self.safety.safety_fwd_hook(SUBARU_CAM_BUS, SubaruMsg.ES_Brake))
 
   def test_fwd_brake_status_main_to_cam_allowed_when_idle(self):
-    """At idle — Brake_Status MAIN→CAM must forward (destination 2)."""
-    self.assertEqual(SUBARU_CAM_BUS,
-                     self.safety.safety_fwd_hook(SUBARU_MAIN_BUS, MSG_SUBARU_Brake_Status))
+    self.assertEqual(SUBARU_CAM_BUS, self.safety.safety_fwd_hook(SUBARU_MAIN_BUS, MSG_SUBARU_Brake_Status))
 
   def test_fwd_es_brake_cam_to_main_blocked_after_hold_tx(self):
-    """After TXing ES_Brake with Brake_Pressure>0 — relay CAM→MAIN must be blocked."""
     self._tx_hold_pressure()
     self.assertEqual(-1, self.safety.safety_fwd_hook(SUBARU_CAM_BUS, SubaruMsg.ES_Brake))
 
   def test_fwd_brake_status_main_to_cam_blocked_after_hold_tx(self):
-    """After TXing ES_Brake hold — Brake_Status MAIN→CAM must be blocked."""
     self._tx_hold_pressure()
-    self.assertEqual(-1,
-                     self.safety.safety_fwd_hook(SUBARU_MAIN_BUS, MSG_SUBARU_Brake_Status))
+    self.assertEqual(-1, self.safety.safety_fwd_hook(SUBARU_MAIN_BUS, MSG_SUBARU_Brake_Status))
 
   def test_fwd_brake_status_main_to_cam_blocked_after_mask_tx(self):
-    """After TXing the Brake_Status mask — forwarding must be blocked too."""
     self._tx_brake_status_mask()
-    self.assertEqual(-1,
-                     self.safety.safety_fwd_hook(SUBARU_MAIN_BUS, MSG_SUBARU_Brake_Status))
+    self.assertEqual(-1, self.safety.safety_fwd_hook(SUBARU_MAIN_BUS, MSG_SUBARU_Brake_Status))
 
   def test_fwd_remains_blocked_during_countdown(self):
-    """Within SUBARU_BRAKE_HOLD_ACTIVE_FRAMES of a hold TX, forwarding stays blocked."""
     self._tx_hold_pressure()
     for k in range(SUBARU_BRAKE_HOLD_ACTIVE_FRAMES - 1):
       self._pump_wheel_speeds(1)
@@ -404,87 +283,48 @@ class TestSubaruBrakeIntercept(TestSubaruSafetyBase):
         self.assertEqual(-1, self.safety.safety_fwd_hook(SUBARU_MAIN_BUS, MSG_SUBARU_Brake_Status))
 
   def test_fwd_restored_after_countdown_expires(self):
-    """After SUBARU_BRAKE_HOLD_ACTIVE_FRAMES Wheel_Speeds RX, forwarding is restored."""
     self._tx_hold_pressure()
     self._pump_wheel_speeds(SUBARU_BRAKE_HOLD_ACTIVE_FRAMES)
-    self.assertEqual(SUBARU_MAIN_BUS,
-                     self.safety.safety_fwd_hook(SUBARU_CAM_BUS, SubaruMsg.ES_Brake))
-    self.assertEqual(SUBARU_CAM_BUS,
-                     self.safety.safety_fwd_hook(SUBARU_MAIN_BUS, MSG_SUBARU_Brake_Status))
+    self.assertEqual(SUBARU_MAIN_BUS, self.safety.safety_fwd_hook(SUBARU_CAM_BUS, SubaruMsg.ES_Brake))
+    self.assertEqual(SUBARU_CAM_BUS, self.safety.safety_fwd_hook(SUBARU_MAIN_BUS, MSG_SUBARU_Brake_Status))
 
   def test_fwd_blocked_retriggered_by_subsequent_hold_tx(self):
-    """A new hold TX after countdown expired must re-block forwarding."""
     self._tx_hold_pressure()
     self._pump_wheel_speeds(SUBARU_BRAKE_HOLD_ACTIVE_FRAMES)
-    self.assertEqual(SUBARU_MAIN_BUS,
-                     self.safety.safety_fwd_hook(SUBARU_CAM_BUS, SubaruMsg.ES_Brake))
+    self.assertEqual(SUBARU_MAIN_BUS, self.safety.safety_fwd_hook(SUBARU_CAM_BUS, SubaruMsg.ES_Brake))
     self._set_standstill()
     self.assertTrue(self._tx(self._es_brake_msg(400)))
     self.assertEqual(-1, self.safety.safety_fwd_hook(SUBARU_CAM_BUS, SubaruMsg.ES_Brake))
 
   def test_fwd_not_blocked_after_zero_pressure_tx(self):
-    """TXing ES_Brake with Brake_Pressure=0 must NOT engage the hold gate."""
+    # zero-pressure TX must not engage the hold gate
     self.safety.set_controls_allowed(True)
     self.assertTrue(self._tx(self._es_brake_msg(0)))
-    self.assertEqual(SUBARU_MAIN_BUS,
-                     self.safety.safety_fwd_hook(SUBARU_CAM_BUS, SubaruMsg.ES_Brake))
-    self.assertEqual(SUBARU_CAM_BUS,
-                     self.safety.safety_fwd_hook(SUBARU_MAIN_BUS, MSG_SUBARU_Brake_Status))
+    self.assertEqual(SUBARU_MAIN_BUS, self.safety.safety_fwd_hook(SUBARU_CAM_BUS, SubaruMsg.ES_Brake))
+    self.assertEqual(SUBARU_CAM_BUS, self.safety.safety_fwd_hook(SUBARU_MAIN_BUS, MSG_SUBARU_Brake_Status))
 
   def test_fwd_es_brake_restored_for_aeb_after_hold_release(self):
-    """
-    AEB-while-moving relay test.
-
-    Scenario: driver was held at standstill (AVH active), then accelerated.
-    While moving, Eyesight triggers AEB. Eyesight sends its own ES_Brake on
-    the cam bus — Panda must relay it to the braking module (cam→main).
-
-    Sequence:
-      1. Hold engaged → hold TX sets the active-hold countdown.
-      2. Driver releases hold (gas press) → Python stops sending hold TXes.
-      3. Car moves → SUBARU_BRAKE_HOLD_ACTIVE_FRAMES Wheel_Speeds frames expire
-         the countdown.
-      4. AEB fires → Eyesight's ES_Brake appears on cam bus.
-         Panda must forward it (return SUBARU_MAIN_BUS), not block it (-1).
-    """
-    # Step 1: hold TX (sets countdown)
+    # after hold release + countdown decay, Eyesight's AEB ES_Brake (cam→main) must relay again
     self._tx_hold_pressure()
-    self.assertEqual(-1, self.safety.safety_fwd_hook(SUBARU_CAM_BUS, SubaruMsg.ES_Brake),
-                     "relay must be blocked during hold")
-
-    # Step 2+3: hold released, countdown decays as car moves
+    self.assertEqual(-1, self.safety.safety_fwd_hook(SUBARU_CAM_BUS, SubaruMsg.ES_Brake))
     self._pump_wheel_speeds(SUBARU_BRAKE_HOLD_ACTIVE_FRAMES)
-
-    # Step 4: AEB fires — Eyesight's ES_Brake (cam→main) must be forwarded
-    self.assertEqual(SUBARU_MAIN_BUS,
-                     self.safety.safety_fwd_hook(SUBARU_CAM_BUS, SubaruMsg.ES_Brake),
-                     "Eyesight AEB ES_Brake must reach braking module after hold release")
-
-  # ── Brake_Pedal relay must stay open (regression for the AVH/SnG-off Eyesight fault) ─────────
+    self.assertEqual(SUBARU_MAIN_BUS, self.safety.safety_fwd_hook(SUBARU_CAM_BUS, SubaruMsg.ES_Brake))
 
   def test_fwd_brake_pedal_main_to_cam_forwarded(self):
-    """Regression: in the no-SnG config openpilot never sends Brake_Pedal, so it must NOT be
-    in the TX allowlist — the relay forwards the car's real Brake_Pedal (0x139) MAIN→CAM to
-    Eyesight. A leftover allowlist entry statically blocked it → Eyesight RX timeout → fault at
-    power-on whenever AVH was on and SnG off (hardware-confirmed 2026-05-22)."""
-    self.assertEqual(SUBARU_CAM_BUS,
-                     self.safety.safety_fwd_hook(SUBARU_MAIN_BUS, MSG_SUBARU_Brake_Pedal))
+    # regression: no-SnG config never sends Brake_Pedal, so the relay forwards the car's real frame
+    # MAIN→CAM. A leftover allowlist entry statically blocked it → Eyesight fault (hardware 2026-05-22)
+    self.assertEqual(SUBARU_CAM_BUS, self.safety.safety_fwd_hook(SUBARU_MAIN_BUS, MSG_SUBARU_Brake_Pedal))
 
   def test_fwd_brake_pedal_not_gated_during_hold(self):
-    """Invariant: subaru_fwd_hook never gates Brake_Pedal. Even while a hold is actively
-    injected, Brake_Pedal MAIN→CAM must keep forwarding to Eyesight (only ES_Brake/Brake_Status
-    are hold-gated)."""
+    # subaru_fwd_hook never gates Brake_Pedal — only ES_Brake / Brake_Status are hold-gated
     self._tx_hold_pressure()
-    self.assertEqual(SUBARU_CAM_BUS,
-                     self.safety.safety_fwd_hook(SUBARU_MAIN_BUS, MSG_SUBARU_Brake_Pedal))
+    self.assertEqual(SUBARU_CAM_BUS, self.safety.safety_fwd_hook(SUBARU_MAIN_BUS, MSG_SUBARU_Brake_Pedal))
 
 
 class TestSubaruSnGBrakeIntercept(TestSubaruBrakeIntercept):
-  """
-  Gen1, SnG + brake_intercept SP params combined.
-  TX allowlist: base LKAS + ES_Distance (no relay) + Throttle (cam, relay)
-                + Brake_Pedal (cam, relay) + ES_Brake (main, relay) + Brake_Status (cam, relay).
-  """
+  # Gen1, SnG + brake_intercept. SnG re-sends Throttle and Brake_Pedal on the cam bus.
+  SP_PARAM = SubaruSafetyFlagsSP.STOP_AND_GO | SubaruSafetyFlagsSP.BRAKE_INTERCEPT
+
   TX_MSGS = (
     lkas_tx_msgs(SUBARU_MAIN_BUS)
     + [[SubaruMsg.Throttle,        SUBARU_CAM_BUS]]
@@ -508,8 +348,6 @@ class TestSubaruSnGBrakeIntercept(TestSubaruBrakeIntercept):
     ),
   }
 
-  # Throttle TX bus=CAM_BUS → blocked arriving from MAIN_BUS (src=MAIN, dst=CAM).
-  # ES_Brake & Brake_Status: conditional — see TestSubaruBrakeHoldFwd.
   FWD_BLACKLISTED_ADDRS = {
     SUBARU_CAM_BUS: [
       SubaruMsg.ES_LKAS,
@@ -523,35 +361,8 @@ class TestSubaruSnGBrakeIntercept(TestSubaruBrakeIntercept):
     ],
   }
 
-  def setUp(self):
-    self.packer = CANPackerSafety("subaru_global_2017_generated")
-    self.safety = libsafety_py.libsafety
-    # CRITICAL: SP param set BEFORE set_safety_hooks
-    self.safety.set_current_safety_param_sp(
-      SubaruSafetyFlagsSP.STOP_AND_GO | SubaruSafetyFlagsSP.BRAKE_INTERCEPT
-    )
-    self.safety.set_safety_hooks(CarParams.SafetyModel.subaru, self.FLAGS)
-    self.safety.init_tests()
-
-  # ── SnG+brake_intercept allowlist checks ────────────────────────────────────
-
-  def test_sng_brake_intercept_includes_es_brake(self):
-    self.assertIn([SubaruMsg.ES_Brake, SUBARU_MAIN_BUS], self.TX_MSGS)
-
-  def test_sng_brake_intercept_includes_throttle(self):
-    self.assertIn([SubaruMsg.Throttle, SUBARU_CAM_BUS], self.TX_MSGS)
-
-  def test_sng_brake_intercept_includes_brake_pedal(self):
-    self.assertIn([MSG_SUBARU_Brake_Pedal, SUBARU_CAM_BUS], self.TX_MSGS)
-
-  def test_sng_brake_intercept_does_not_include_es_brake_on_wrong_bus(self):
-    """ES_Brake is on MAIN bus, not CAM bus."""
-    self.assertNotIn([SubaruMsg.ES_Brake, SUBARU_CAM_BUS], self.TX_MSGS)
-
-  # Override: re-init tests that change SP param must restore SnG|BRAKE_INTERCEPT
-
   def test_no_brake_intercept_es_brake_blocked(self):
-    """Re-init with ONLY SnG (no brake_intercept) → ES_Brake not in allowlist."""
+    # re-init with ONLY SnG (no brake_intercept) → ES_Brake not in allowlist
     self.safety.set_current_safety_param_sp(SubaruSafetyFlagsSP.STOP_AND_GO)
     self.safety.set_safety_hooks(CarParams.SafetyModel.subaru, 0)
     self.safety.init_tests()
@@ -561,7 +372,6 @@ class TestSubaruSnGBrakeIntercept(TestSubaruBrakeIntercept):
     self.assertFalse(self._tx(self._es_brake_msg(100)))
 
   def test_gen2_with_brake_intercept_sp_param_es_brake_blocked(self):
-    """Gen2 + SnG|brake_intercept → ES_Brake still not in allowlist."""
     self.safety.set_current_safety_param_sp(
       SubaruSafetyFlagsSP.STOP_AND_GO | SubaruSafetyFlagsSP.BRAKE_INTERCEPT
     )
@@ -573,47 +383,28 @@ class TestSubaruSnGBrakeIntercept(TestSubaruBrakeIntercept):
     self.assertFalse(self._tx(self._es_brake_msg(100)))
 
   def test_brake_status_blocked_without_brake_intercept(self):
-    """In SnG-only mode (no brake_intercept), Brake_Status not in allowlist → blocked."""
     self.safety.set_current_safety_param_sp(SubaruSafetyFlagsSP.STOP_AND_GO)
     self.safety.set_safety_hooks(CarParams.SafetyModel.subaru, 0)
     self.safety.init_tests()
     self.safety.set_controls_allowed(True)
     self.assertFalse(self._tx(self._brake_status_msg(0)))
 
-  # ── Brake_Pedal asymmetry: SnG actively re-sends Brake_Pedal on the cam bus, so it IS in the
-  # allowlist and the relay is statically blocked MAIN→CAM (openpilot is the sender). Override the
-  # no-SnG regression/invariant, which expect the relay open. Guards the intentional asymmetry.
-
+  # SnG sends Brake_Pedal on cam → it IS in the allowlist → relay statically blocked MAIN→CAM.
+  # Override the no-SnG regression/invariant, which expect the relay open.
   def test_fwd_brake_pedal_main_to_cam_forwarded(self):
-    """SnG sends Brake_Pedal on cam → in allowlist → relay statically blocked MAIN→CAM (-1)."""
     self.assertEqual(-1, self.safety.safety_fwd_hook(SUBARU_MAIN_BUS, MSG_SUBARU_Brake_Pedal))
 
   def test_fwd_brake_pedal_not_gated_during_hold(self):
-    """SnG: Brake_Pedal stays statically blocked MAIN→CAM during a hold too (negative control)."""
     self._tx_hold_pressure()
     self.assertEqual(-1, self.safety.safety_fwd_hook(SUBARU_MAIN_BUS, MSG_SUBARU_Brake_Pedal))
 
 
 class TestSubaruLongBrakeIntercept(TestSubaruBrakeIntercept):
-  """
-  Gen1, alpha long enabled, brake_intercept SP param set, no SnG.
-  This is the scenario that fails on real hardware (route dde08cad3a74cd94|00000012):
-  alpha long ON, MADS active, op long not engaged, AVH wants to hold at standstill.
-
-  Expected behavior:
-    - ES_Brake=600 at standstill+MADS must be ACCEPTED (currently rejected by
-      longitudinal_brake_checks because controls_allowed=False).
-    - Brake_Status mask must be in TX allowlist and accepted when subaru_brake_intercept set.
-    - When controls_allowed=True (ACC engaged), full-range ES_Brake (any pressure ≤ max_brake)
-      must still be accepted — the union with AVH-valid set must not narrow the long path.
-  """
+  # Gen1, alpha long enabled, brake_intercept, no SnG. Hardware-failing scenario
+  # (route dde08cad3a74cd94|00000012): alpha long ON, MADS active, op long not engaged,
+  # AVH wants to hold at standstill. ES_Brake=600 at standstill+MADS must be accepted.
   FLAGS = SubaruSafetyFlags.LONG
 
-  # TX allowlist when subaru_longitudinal && subaru_brake_intercept (no SnG).
-  # Must include: base LKAS + long common (ES_Distance, ES_Brake, ES_Status)
-  # + Brake_Status (cam, conditional fwd via disable_static_blocking).
-  # No Brake_Pedal: openpilot never sends it here, so the relay forwards the car's real
-  # Brake_Pedal to Eyesight (stock). The old leftover entry blocked it → fault (fixed 2026-05-22).
   TX_MSGS = (
     lkas_tx_msgs(SUBARU_MAIN_BUS)
     + [[SubaruMsg.ES_Brake,        SUBARU_MAIN_BUS]]
@@ -621,8 +412,6 @@ class TestSubaruLongBrakeIntercept(TestSubaruBrakeIntercept):
     + [[MSG_SUBARU_Brake_Status,   SUBARU_CAM_BUS]]
   )
 
-  # MAIN bus relay addrs: long mode adds ES_Distance + ES_Status (check_relay=true in
-  # SUBARU_COMMON_LONG_TX_MSGS). CAM bus has only Brake_Status (no Brake_Pedal — removed).
   RELAY_MALFUNCTION_ADDRS = {
     SUBARU_MAIN_BUS: (
       SubaruMsg.ES_LKAS, SubaruMsg.ES_DashStatus, SubaruMsg.ES_LKAS_State,
@@ -633,10 +422,8 @@ class TestSubaruLongBrakeIntercept(TestSubaruBrakeIntercept):
     ),
   }
 
-  # In long mode, ES_Brake + ES_Distance + ES_Status cam→main are ALL statically blocked
-  # (SUBARU_COMMON_LONG_TX_MSGS uses check_relay=true for all three, no disable_static_blocking).
-  # Op long is the sole sender of these on main bus. Brake_Pedal is NOT blocked — the relay
-  # forwards the car's real frame MAIN→CAM to Eyesight (stock).
+  # In long mode op long is the sole sender of ES_Brake/ES_Distance/ES_Status on main, so all three
+  # are statically blocked cam→main. Brake_Pedal is not blocked (relay forwards the car's real frame).
   FWD_BLACKLISTED_ADDRS = {
     SUBARU_CAM_BUS: [
       SubaruMsg.ES_LKAS, SubaruMsg.ES_DashStatus, SubaruMsg.ES_LKAS_State,
@@ -644,168 +431,72 @@ class TestSubaruLongBrakeIntercept(TestSubaruBrakeIntercept):
     ],
   }
 
-  def setUp(self):
-    self.packer = CANPackerSafety("subaru_global_2017_generated")
-    self.safety = libsafety_py.libsafety
-    # CRITICAL: SP param set BEFORE set_safety_hooks (panda reads at init).
-    self.safety.set_current_safety_param_sp(SubaruSafetyFlagsSP.BRAKE_INTERCEPT)
-    self.safety.set_safety_hooks(CarParams.SafetyModel.subaru, self.FLAGS)
-    self.safety.init_tests()
-
-  # ── Allowlist sanity ─────────────────────────────────────────────────────────
-
-  def test_long_plus_intercept_includes_es_brake_main(self):
-    self.assertIn([SubaruMsg.ES_Brake, SUBARU_MAIN_BUS], self.TX_MSGS)
-
-  def test_long_plus_intercept_includes_brake_status_cam(self):
-    self.assertIn([MSG_SUBARU_Brake_Status, SUBARU_CAM_BUS], self.TX_MSGS)
-
-  def test_long_plus_intercept_includes_es_status_main(self):
-    self.assertIn([SubaruMsg.ES_Status, SUBARU_MAIN_BUS], self.TX_MSGS)
-
-  # ── Core regression: MADS-only AVH hold at standstill with alpha long ────────
-
-  def test_avh_hold_pressure_allowed_with_mads_at_standstill(self):
-    """
-    Reproduces the failing log scenario: alpha long enabled, op long NOT engaged,
-    MADS active (controls_allowed_lateral=True), standstill.
-    AVH must be allowed to inject ES_Brake=BRAKE_HOLD_PRESSURE (600).
-    """
-    self._set_standstill()
-    self.safety.set_controls_allowed(False)             # ACC off
-    self.safety.set_controls_allowed_lateral(True)      # MADS active
-    self.assertTrue(self._tx(self._es_brake_msg(600)),
-                    "AVH hold at standstill+MADS must be allowed when alpha long is on")
-
-  def test_avh_hold_pressure_blocked_when_moving_without_acc(self):
-    """
-    Safety invariant: with only MADS (no ACC), brake injection is allowed
-    ONLY at standstill (+ the settling window). Once truly rolling, AVH is blocked.
-    """
-    self._exhaust_hysteresis()                          # countdown maxed → no longer settling
+  def _engage(self):
+    # MADS-only (no ACC): in long mode controls_allowed=True would take the long path, masking the
+    # AVH standstill invariant
     self.safety.set_controls_allowed(False)
     self.safety.set_controls_allowed_lateral(True)
-    self.assertFalse(self._tx(self._es_brake_msg(600)),
-                     "AVH must NOT inject brake while rolling without ACC engaged")
+
+  def test_avh_hold_pressure_allowed_with_mads_at_standstill(self):
+    # alpha long on, op long NOT engaged, MADS active, standstill → AVH may inject ES_Brake=600
+    self._set_standstill()
+    self.safety.set_controls_allowed(False)
+    self.safety.set_controls_allowed_lateral(True)
+    self.assertTrue(self._tx(self._es_brake_msg(600)))
+
+  def test_avh_hold_pressure_blocked_when_moving_without_acc(self):
+    # MADS-only: brake injection allowed only at standstill (+ settling); blocked once rolling
+    self._exhaust_hysteresis()
+    self.safety.set_controls_allowed(False)
+    self.safety.set_controls_allowed_lateral(True)
+    self.assertFalse(self._tx(self._es_brake_msg(600)))
 
   def test_long_path_unchanged_when_acc_engaged(self):
-    """
-    When ACC is engaged (controls_allowed=True), full ES_Brake range must work
-    EVEN AT NON-STANDSTILL — the long-path semantics (op-long deceleration from
-    rolling speed) must not be narrowed by adding the AVH union.
-    """
-    self._exhaust_hysteresis()                          # rolling, NOT in settling window
+    # adding the AVH union must not narrow the long path: ACC engaged → full ES_Brake range while rolling
+    self._exhaust_hysteresis()
     self.safety.set_controls_allowed(True)
     self.safety.set_controls_allowed_lateral(True)
-    self.assertTrue(self._tx(self._es_brake_msg(100)),  # op long mid-brake
-                    "op-long must brake while rolling with ACC engaged")
+    self.assertTrue(self._tx(self._es_brake_msg(100)))
 
   def test_brake_pressure_above_max_rejected(self):
-    """Max brake limit (600) is enforced regardless of which path is permissive."""
     self._set_standstill()
     self.safety.set_controls_allowed(True)
     self.safety.set_controls_allowed_lateral(True)
     self.assertFalse(self._tx(self._es_brake_msg(601)))
 
   def test_no_controls_no_lateral_blocks_nonzero_brake(self):
-    """Neither ACC nor MADS → any nonzero brake is rejected."""
     self._set_standstill()
     self.safety.set_controls_allowed(False)
     self.safety.set_controls_allowed_lateral(False)
     self.assertFalse(self._tx(self._es_brake_msg(100)))
-    self.assertTrue(self._tx(self._es_brake_msg(0)),
-                    "Zero brake is always allowed (inactive value)")
-
-  # ── Brake_Status mask coverage ───────────────────────────────────────────────
+    self.assertTrue(self._tx(self._es_brake_msg(0)))
 
   def test_brake_status_mask_allowed_with_brake_intercept(self):
-    """Brake_Status with ES_Brake_bit=0 must be allowed when subaru_brake_intercept set,
-    regardless of subaru_longitudinal state."""
     self.assertTrue(self._tx(self._brake_status_msg(0)))
 
   def test_brake_status_mask_with_es_brake_bit_set_rejected(self):
-    """Brake_Status MUST clear the ES_Brake bit (existing invariant from line 259)."""
     self.assertFalse(self._tx(self._brake_status_msg(1)))
 
-  # ── Gen2 negative ────────────────────────────────────────────────────────────
-
   def test_gen2_long_with_brake_intercept_uses_gen2_long_path(self):
-    """
-    Gen2 + LONG + brake_intercept must continue to use SUBARU_GEN2_LONG_TX_MSGS
-    (no AVH support on gen2 — interfaces.py never sets BRAKE_HOLD on gen2 anyway,
-    but panda must not silently accept Brake_Status on the cam bus for gen2).
-    """
+    # gen2 has no AVH — Brake_Status must not be in the gen2 long allowlist
     self.safety.set_current_safety_param_sp(SubaruSafetyFlagsSP.BRAKE_INTERCEPT)
     self.safety.set_safety_hooks(CarParams.SafetyModel.subaru,
                                   SubaruSafetyFlags.LONG | SubaruSafetyFlags.GEN2)
     self.safety.init_tests()
-    # Brake_Status must NOT be in gen2 long allowlist.
     self.assertFalse(self._tx(self._brake_status_msg(0)))
 
-  # ── Moving-while-MADS overrides: parent uses controls_allowed=True which, in long mode,
-  # triggers the longitudinal path (allowed while rolling). Override to MADS-only
-  # (controls_allowed=False, controls_allowed_lateral=True) to properly test the AVH invariant.
-
-  def test_es_brake_nonzero_blocked_when_moving(self):
-    """MADS-only: once rolling past settling window, AVH must not inject brake."""
-    self._set_standstill()
-    self.safety.set_controls_allowed(False)
-    self.safety.set_controls_allowed_lateral(True)
-    self._exhaust_hysteresis()
-    self.assertFalse(self._tx(self._es_brake_msg(100)))
-
-  def test_es_brake_nonzero_blocked_when_moving_various_pressures(self):
-    """MADS-only: several pressures all blocked once fully moving past settling window."""
-    self._set_standstill()
-    self.safety.set_controls_allowed(False)
-    self.safety.set_controls_allowed_lateral(True)
-    self._exhaust_hysteresis()
-    for pressure in (1, 50, 100, 300, 600):
-      with self.subTest(pressure=pressure):
-        self.assertFalse(self._tx(self._es_brake_msg(pressure)))
-
-  def test_race_a_blocked_at_frame3(self):
-    """MADS-only: at BRAKE_INTERCEPT_RELEASE_FRAMES moving frames, not settling → blocked."""
-    self._set_standstill()
-    self.safety.set_controls_allowed(False)
-    self.safety.set_controls_allowed_lateral(True)
-    self._set_moving(frames=BRAKE_INTERCEPT_RELEASE_FRAMES)
-    self.assertFalse(self._tx(self._es_brake_msg(100)))
-
-  def test_race_a_blocked_after_hysteresis_frame4plus(self):
-    """MADS-only: 4+ frames past settling → blocked."""
-    self._set_standstill()
-    self.safety.set_controls_allowed(False)
-    self.safety.set_controls_allowed_lateral(True)
-    self._exhaust_hysteresis()
-    self.assertFalse(self._tx(self._es_brake_msg(100)))
-
-  def test_race_a_countdown_resets_on_standstill(self):
-    """MADS-only: returning to standstill after rolling re-allows non-zero pressure."""
-    self._set_standstill()
-    self.safety.set_controls_allowed(False)
-    self.safety.set_controls_allowed_lateral(True)
-    self._exhaust_hysteresis()
-    self.assertFalse(self._tx(self._es_brake_msg(100)))
-    self._set_standstill()
-    self.assertTrue(self._tx(self._es_brake_msg(100)))
-
-  # ── Fwd overrides: ES_Brake cam→main is ALWAYS statically blocked in long mode ─
+  # ── Fwd overrides: in long mode ES_Brake cam→main is ALWAYS statically blocked (op long owns it) ─
 
   def test_fwd_es_brake_cam_to_main_allowed_when_idle(self):
-    """In long mode, op long owns ES_Brake on main bus — cam→main always statically blocked."""
     self.assertEqual(-1, self.safety.safety_fwd_hook(SUBARU_CAM_BUS, SubaruMsg.ES_Brake))
 
   def test_fwd_restored_after_countdown_expires(self):
-    """After countdown: Brake_Status fwd restored; ES_Brake remains statically blocked."""
     self._tx_hold_pressure()
     self._pump_wheel_speeds(SUBARU_BRAKE_HOLD_ACTIVE_FRAMES)
     self.assertEqual(-1, self.safety.safety_fwd_hook(SUBARU_CAM_BUS, SubaruMsg.ES_Brake))
-    self.assertEqual(SUBARU_CAM_BUS,
-                     self.safety.safety_fwd_hook(SUBARU_MAIN_BUS, MSG_SUBARU_Brake_Status))
+    self.assertEqual(SUBARU_CAM_BUS, self.safety.safety_fwd_hook(SUBARU_MAIN_BUS, MSG_SUBARU_Brake_Status))
 
   def test_fwd_blocked_retriggered_by_subsequent_hold_tx(self):
-    """Re-trigger after countdown: Brake_Status re-blocked; ES_Brake always blocked."""
     self._tx_hold_pressure()
     self._pump_wheel_speeds(SUBARU_BRAKE_HOLD_ACTIVE_FRAMES)
     self.assertEqual(-1, self.safety.safety_fwd_hook(SUBARU_CAM_BUS, SubaruMsg.ES_Brake))
@@ -814,15 +505,12 @@ class TestSubaruLongBrakeIntercept(TestSubaruBrakeIntercept):
     self.assertEqual(-1, self.safety.safety_fwd_hook(SUBARU_CAM_BUS, SubaruMsg.ES_Brake))
 
   def test_fwd_not_blocked_after_zero_pressure_tx(self):
-    """Zero-pressure TX: no hold countdown set; Brake_Status still forwarded; ES_Brake always -1."""
     self.safety.set_controls_allowed(True)
     self.assertTrue(self._tx(self._es_brake_msg(0)))
     self.assertEqual(-1, self.safety.safety_fwd_hook(SUBARU_CAM_BUS, SubaruMsg.ES_Brake))
-    self.assertEqual(SUBARU_CAM_BUS,
-                     self.safety.safety_fwd_hook(SUBARU_MAIN_BUS, MSG_SUBARU_Brake_Status))
+    self.assertEqual(SUBARU_CAM_BUS, self.safety.safety_fwd_hook(SUBARU_MAIN_BUS, MSG_SUBARU_Brake_Status))
 
   def test_fwd_remains_blocked_during_countdown(self):
-    """During countdown: Brake_Status blocked; ES_Brake also -1 (always, in long mode)."""
     self._tx_hold_pressure()
     for k in range(SUBARU_BRAKE_HOLD_ACTIVE_FRAMES - 1):
       self._pump_wheel_speeds(1)
@@ -831,61 +519,42 @@ class TestSubaruLongBrakeIntercept(TestSubaruBrakeIntercept):
         self.assertEqual(-1, self.safety.safety_fwd_hook(SUBARU_MAIN_BUS, MSG_SUBARU_Brake_Status))
 
   def test_fwd_es_brake_restored_for_aeb_after_hold_release(self):
-    """In long mode, ES_Brake cam→main is always blocked — op long handles AEB, not Eyesight relay."""
+    # long mode: ES_Brake cam→main stays blocked even after hold release — op long handles AEB
     self._tx_hold_pressure()
     self._pump_wheel_speeds(SUBARU_BRAKE_HOLD_ACTIVE_FRAMES)
-    self.assertEqual(-1, self.safety.safety_fwd_hook(SUBARU_CAM_BUS, SubaruMsg.ES_Brake),
-                     "ES_Brake cam→main must stay blocked in long mode even after hold release")
+    self.assertEqual(-1, self.safety.safety_fwd_hook(SUBARU_CAM_BUS, SubaruMsg.ES_Brake))
 
   def test_long_path_brake_does_not_bump_countdown(self):
-    """Op-long braking via long_valid path must NOT bump the hold countdown.
-    Scenario 3a/3b: if countdown were bumped, Eyesight's Brake_Status relay would be
-    starved during sustained ACC braking, causing ACC faults."""
+    # op-long braking (long_valid path) must not bump the hold countdown, else Eyesight's
+    # Brake_Status relay starves during sustained ACC braking → ACC faults
     self.safety.set_controls_allowed(True)
-    self._set_moving(frames=BRAKE_INTERCEPT_RELEASE_FRAMES + 1)  # fully moving, past settling
-    # TX via long_valid path (ACC on, moving — avh_valid=False)
-    self.assertTrue(self._tx(self._es_brake_msg(300)),
-                    "op-long brake TX must be allowed via long_valid path")
-    # Countdown must NOT have been bumped — Brake_Status must still forward
-    self.assertEqual(SUBARU_CAM_BUS,
-                     self.safety.safety_fwd_hook(SUBARU_MAIN_BUS, MSG_SUBARU_Brake_Status),
-                     "Brake_Status MAIN→CAM must NOT be blocked after op-long brake TX (only AVH hold may block)")
+    self._set_moving(frames=BRAKE_INTERCEPT_RELEASE_FRAMES + 1)
+    self.assertTrue(self._tx(self._es_brake_msg(300)))
+    self.assertEqual(SUBARU_CAM_BUS, self.safety.safety_fwd_hook(SUBARU_MAIN_BUS, MSG_SUBARU_Brake_Status))
 
   def test_sustained_long_braking_does_not_starve_brake_status_relay(self):
-    """30 consecutive op-long brake TXes must not starve the Brake_Status fwd relay.
-    Without the fix, every TX refreshes the countdown indefinitely.
-    Must keep vehicle_moving=True throughout — uses non-zero speed RX to stay in long_valid path."""
+    # 30 consecutive op-long brake TXes must not starve the Brake_Status relay (stay moving so
+    # avh_valid=False → long path only)
     self.safety.set_controls_allowed(True)
     self._set_moving(frames=BRAKE_INTERCEPT_RELEASE_FRAMES + 1)
     for _ in range(30):
       self.assertTrue(self._tx(self._es_brake_msg(300)))
-      self._rx(self._speed_msg(10))  # non-zero: stay moving so avh_valid=False (long path only)
-    self.assertEqual(SUBARU_CAM_BUS,
-                     self.safety.safety_fwd_hook(SUBARU_MAIN_BUS, MSG_SUBARU_Brake_Status),
-                     "Brake_Status must still forward to cam after sustained op-long braking")
+      self._rx(self._speed_msg(10))
+    self.assertEqual(SUBARU_CAM_BUS, self.safety.safety_fwd_hook(SUBARU_MAIN_BUS, MSG_SUBARU_Brake_Status))
 
   def test_safety_reinit_resets_countdown(self):
-    """Re-calling set_safety_hooks must clear the active-hold countdown immediately."""
+    # re-calling set_safety_hooks must clear the active-hold countdown immediately
     self._tx_hold_pressure()
-    # Verify countdown is set
-    self.assertEqual(-1, self.safety.safety_fwd_hook(SUBARU_MAIN_BUS, MSG_SUBARU_Brake_Status),
-                     "countdown should be active after hold TX")
-    # Re-init safety
+    self.assertEqual(-1, self.safety.safety_fwd_hook(SUBARU_MAIN_BUS, MSG_SUBARU_Brake_Status))
     self.safety.set_current_safety_param_sp(SubaruSafetyFlagsSP.BRAKE_INTERCEPT)
     self.safety.set_safety_hooks(CarParams.SafetyModel.subaru, self.FLAGS)
     self.safety.init_tests()
-    # Countdown must be reset to 0 — fwd must be immediately open
-    self.assertEqual(SUBARU_CAM_BUS,
-                     self.safety.safety_fwd_hook(SUBARU_MAIN_BUS, MSG_SUBARU_Brake_Status),
-                     "Brake_Status fwd must be unblocked immediately after safety reinit")
+    self.assertEqual(SUBARU_CAM_BUS, self.safety.safety_fwd_hook(SUBARU_MAIN_BUS, MSG_SUBARU_Brake_Status))
 
 
 class TestSubaruLongSnGBrakeIntercept(TestSubaruLongBrakeIntercept):
-  """
-  Gen1, alpha long enabled, SnG + brake_intercept SP params, AVH.
-  This is the on-device configuration for SUBARU_IMPREZA_2020 with both
-  StopAndGo and alpha long enabled.
-  """
+  # Gen1, alpha long + SnG + brake_intercept — the on-device config for SUBARU_IMPREZA_2020.
+  SP_PARAM = SubaruSafetyFlagsSP.STOP_AND_GO | SubaruSafetyFlagsSP.BRAKE_INTERCEPT
 
   TX_MSGS = (
     lkas_tx_msgs(SUBARU_MAIN_BUS)
@@ -916,21 +585,6 @@ class TestSubaruLongSnGBrakeIntercept(TestSubaruLongBrakeIntercept):
     ],
   }
 
-  def setUp(self):
-    self.packer = CANPackerSafety("subaru_global_2017_generated")
-    self.safety = libsafety_py.libsafety
-    self.safety.set_current_safety_param_sp(
-      SubaruSafetyFlagsSP.STOP_AND_GO | SubaruSafetyFlagsSP.BRAKE_INTERCEPT
-    )
-    self.safety.set_safety_hooks(CarParams.SafetyModel.subaru, self.FLAGS)
-    self.safety.init_tests()
-
-  def test_long_sng_intercept_includes_throttle_cam(self):
-    self.assertIn([SubaruMsg.Throttle, SUBARU_CAM_BUS], self.TX_MSGS)
-
-  def test_long_sng_intercept_includes_brake_pedal_cam(self):
-    self.assertIn([MSG_SUBARU_Brake_Pedal, SUBARU_CAM_BUS], self.TX_MSGS)
-
   def test_gen2_long_with_brake_intercept_uses_gen2_long_path(self):
     self.safety.set_current_safety_param_sp(
       SubaruSafetyFlagsSP.STOP_AND_GO | SubaruSafetyFlagsSP.BRAKE_INTERCEPT
@@ -940,16 +594,11 @@ class TestSubaruLongSnGBrakeIntercept(TestSubaruLongBrakeIntercept):
     self.safety.init_tests()
     self.assertFalse(self._tx(self._brake_status_msg(0)))
 
-  # ── Brake_Pedal asymmetry: SnG re-sends Brake_Pedal on cam → it IS in the allowlist →
-  # relay statically blocked MAIN→CAM. Override the no-SnG regression/invariant inherited
-  # from TestSubaruBrakeIntercept.
-
+  # SnG sends Brake_Pedal on cam → in allowlist → relay statically blocked MAIN→CAM
   def test_fwd_brake_pedal_main_to_cam_forwarded(self):
-    """SnG sends Brake_Pedal on cam → in allowlist → relay statically blocked MAIN→CAM (-1)."""
     self.assertEqual(-1, self.safety.safety_fwd_hook(SUBARU_MAIN_BUS, MSG_SUBARU_Brake_Pedal))
 
   def test_fwd_brake_pedal_not_gated_during_hold(self):
-    """SnG: Brake_Pedal stays statically blocked MAIN→CAM during a hold too (negative control)."""
     self._tx_hold_pressure()
     self.assertEqual(-1, self.safety.safety_fwd_hook(SUBARU_MAIN_BUS, MSG_SUBARU_Brake_Pedal))
 
