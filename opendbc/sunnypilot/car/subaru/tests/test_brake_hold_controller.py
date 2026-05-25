@@ -1,4 +1,4 @@
-import pytest
+import unittest
 from unittest.mock import MagicMock, patch
 
 from opendbc.can import CANParser
@@ -124,84 +124,88 @@ def run_update_capture_both(ctrl, CC=None, CC_SP=None, CS=None):
   return mock_bh, mock_bsh
 
 
-class TestBrakeHoldController:
+class TestBrakeHoldController(unittest.TestCase):
 
   def _get_brake_value(self, mock_bh):
-    assert mock_bh.called, "create_es_brake_hold was not called"
+    self.assertTrue(mock_bh.called, "create_es_brake_hold was not called")
     return mock_bh.call_args[0][4]  # (packer, frame, es_brake_msg, long_enabled, brake_value)
 
   def _prime(self, ctrl):
     ctrl.frame = 1  # odd frame: priming runs but frame%5 != 0 (isolates priming from hold/reset)
     run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True), CS=make_CS(vEgoRaw=0.5, brakePressed=True))
-    assert ctrl._brake_hold_primed is True, "precondition: must be primed"
+    self.assertTrue(ctrl._brake_hold_primed, "precondition: must be primed")
 
   def test_primed_false_on_init(self):
-    assert make_ctrl()._brake_hold_primed is False
+    self.assertFalse(make_ctrl()._brake_hold_primed)
 
-  @pytest.mark.parametrize("mads_enabled,vego,brake,gear,expected", [
-    (False, 0.5, True, GearShifter.drive, False),  # mads disabled
-    (True, 0.5, False, GearShifter.drive, False),  # brake not pressed
-    (True, 2.0, True, GearShifter.drive, False),  # speed >= 1.5
-    (True, 0.5, True, GearShifter.park, False),  # park
-    (True, 0.5, True, GearShifter.reverse, False),  # reverse
-    (True, 0.5, True, GearShifter.drive, True),  # all met → primed
-  ])
-  def test_priming_conditions(self, mads_enabled, vego, brake, gear, expected):
+  def test_priming_conditions(self):
     # priming requires mads.enabled AND vEgoRaw<1.5 AND brakePressed AND gear not park/reverse
-    ctrl = make_ctrl()
-    ctrl.frame = 1
-    run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=mads_enabled),
-               CS=make_CS(vEgoRaw=vego, brakePressed=brake, gear=gear))
-    assert ctrl._brake_hold_primed is expected
+    for mads_enabled, vego, brake, gear, expected in [
+      (False, 0.5, True, GearShifter.drive, False),  # mads disabled
+      (True, 0.5, False, GearShifter.drive, False),  # brake not pressed
+      (True, 2.0, True, GearShifter.drive, False),  # speed >= 1.5
+      (True, 0.5, True, GearShifter.park, False),  # park
+      (True, 0.5, True, GearShifter.reverse, False),  # reverse
+      (True, 0.5, True, GearShifter.drive, True),  # all met → primed
+    ]:
+      with self.subTest(mads_enabled=mads_enabled, vego=vego, brake=brake, gear=gear):
+        ctrl = make_ctrl()
+        ctrl.frame = 1
+        run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=mads_enabled),
+                   CS=make_CS(vEgoRaw=vego, brakePressed=brake, gear=gear))
+        self.assertIs(ctrl._brake_hold_primed, expected)
 
-  @pytest.mark.parametrize("primed,standstill,brake,gas,gear,holds", [
-    (False, True, False, False, GearShifter.drive, False),  # not primed
-    (True, False, False, False, GearShifter.drive, False),  # not standstill — ACC may be braking
-    (True, True, True, False, GearShifter.drive, True),   # seamless hold, foot still on pedal
-    (True, True, False, True,  GearShifter.drive, False),  # gas pressed
-    (True, True, False, False, GearShifter.park, False),  # park
-    (True, True, False, False, GearShifter.drive, True),   # all met
-  ])
-  def test_holding_conditions(self, primed, standstill, brake, gas, gear, holds):
-    ctrl = make_ctrl()
-    ctrl.frame = 0  # frame%5 == 0: hold branch runs
-    ctrl._brake_hold_primed = primed
-    mock_bh = run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
-                         CS=make_CS(standstill=standstill, brakePressed=brake, gasPressed=gas, gear=gear))
-    if holds:
-      assert self._get_brake_value(mock_bh) == CarControllerParams.BRAKE_HOLD_PRESSURE
-    else:
-      assert not mock_bh.called
+  def test_holding_conditions(self):
+    for primed, standstill, brake, gas, gear, holds in [
+      (False, True, False, False, GearShifter.drive, False),  # not primed
+      (True, False, False, False, GearShifter.drive, False),  # not standstill — ACC may be braking
+      (True, True, True, False, GearShifter.drive, True),   # seamless hold, foot still on pedal
+      (True, True, False, True,  GearShifter.drive, False),  # gas pressed
+      (True, True, False, False, GearShifter.park, False),  # park
+      (True, True, False, False, GearShifter.drive, True),   # all met
+    ]:
+      with self.subTest(primed=primed, standstill=standstill, brake=brake, gas=gas, gear=gear):
+        ctrl = make_ctrl()
+        ctrl.frame = 0  # frame%5 == 0: hold branch runs
+        ctrl._brake_hold_primed = primed
+        mock_bh = run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
+                             CS=make_CS(standstill=standstill, brakePressed=brake, gasPressed=gas, gear=gear))
+        if holds:
+          self.assertEqual(self._get_brake_value(mock_bh), CarControllerParams.BRAKE_HOLD_PRESSURE)
+        else:
+          self.assertFalse(mock_bh.called)
 
-  @pytest.mark.parametrize("primed,standstill,vego,aeb_status,eyesight_pressure,expected", [
-    (True, True, 0.0, 8, 450, 450),  # AEB overrides hold → echo Eyesight pressure
-    (True, True, 0.0, 0, 0, CarControllerParams.BRAKE_HOLD_PRESSURE),  # no AEB, holding → hold pressure
-    (False, False, 8.0, 4, 600, 600),  # AEB while moving, not holding → passthrough
-  ])
-  def test_aeb_vs_hold_brake_value(self, primed, standstill, vego, aeb_status, eyesight_pressure, expected):
-    ctrl = make_ctrl()
-    ctrl.frame = 0
-    ctrl._brake_hold_primed = primed
-    es_msg = {"AEB_Status": aeb_status, "CHECKSUM": 0, "Signal1": 0, "Brake_Pressure": eyesight_pressure,
-              "Cruise_Brake_Lights": 0, "Cruise_Brake_Fault": 0, "Cruise_Brake_Active": 0,
-              "Cruise_Activated": 0, "Signal3": 0}
-    mock_bh = run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
-                         CS=make_CS(standstill=standstill, vEgoRaw=vego, brakePressed=False,
-                                    gasPressed=False, es_brake_msg=es_msg))
-    assert self._get_brake_value(mock_bh) == expected
+  def test_aeb_vs_hold_brake_value(self):
+    for primed, standstill, vego, aeb_status, eyesight_pressure, expected in [
+      (True, True, 0.0, 8, 450, 450),  # AEB overrides hold → echo Eyesight pressure
+      (True, True, 0.0, 0, 0, CarControllerParams.BRAKE_HOLD_PRESSURE),  # no AEB, holding → hold pressure
+      (False, False, 8.0, 4, 600, 600),  # AEB while moving, not holding → passthrough
+    ]:
+      with self.subTest(aeb_status=aeb_status, eyesight_pressure=eyesight_pressure):
+        ctrl = make_ctrl()
+        ctrl.frame = 0
+        ctrl._brake_hold_primed = primed
+        es_msg = {"AEB_Status": aeb_status, "CHECKSUM": 0, "Signal1": 0, "Brake_Pressure": eyesight_pressure,
+                  "Cruise_Brake_Lights": 0, "Cruise_Brake_Fault": 0, "Cruise_Brake_Active": 0,
+                  "Cruise_Activated": 0, "Signal3": 0}
+        mock_bh = run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
+                             CS=make_CS(standstill=standstill, vEgoRaw=vego, brakePressed=False,
+                                        gasPressed=False, es_brake_msg=es_msg))
+        self.assertEqual(self._get_brake_value(mock_bh), expected)
 
-  @pytest.mark.parametrize("mads_enabled,cs_kwargs", [
-    (True,  dict(vEgoRaw=0.5, gasPressed=True, standstill=True)),  # gas pressed
-    (False, dict(vEgoRaw=0.5, standstill=True)),                   # mads disabled
-    (True,  dict(vEgoRaw=1.0, standstill=False)),                  # speed above threshold
-  ])
-  def test_latch_reset(self, mads_enabled, cs_kwargs):
+  def test_latch_reset(self):
     # prime at frame 1, then trigger a reset condition inside the frame%5==0 block
-    ctrl = make_ctrl()
-    self._prime(ctrl)
-    ctrl.frame = 5
-    run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=mads_enabled), CS=make_CS(brakePressed=False, **cs_kwargs))
-    assert ctrl._brake_hold_primed is False
+    for mads_enabled, cs_kwargs in [
+      (True,  dict(vEgoRaw=0.5, gasPressed=True, standstill=True)),  # gas pressed
+      (False, dict(vEgoRaw=0.5, standstill=True)),                   # mads disabled
+      (True,  dict(vEgoRaw=1.0, standstill=False)),                  # speed above threshold
+    ]:
+      with self.subTest(mads_enabled=mads_enabled, cs_kwargs=cs_kwargs):
+        ctrl = make_ctrl()
+        self._prime(ctrl)
+        ctrl.frame = 5
+        run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=mads_enabled), CS=make_CS(brakePressed=False, **cs_kwargs))
+        self.assertFalse(ctrl._brake_hold_primed)
 
   def test_none_guard_no_send(self):
     ctrl = make_ctrl()
@@ -209,24 +213,25 @@ class TestBrakeHoldController:
     CS = make_CS()
     CS.es_brake_msg = None
     mock_bh = run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True), CS=CS)
-    assert not mock_bh.called
+    self.assertFalse(mock_bh.called)
 
   def test_brake_hold_flag_required(self):
     ctrl = make_ctrl(brake_hold=False)
     ctrl.frame = 0
     ctrl._brake_hold_primed = True
     mock_bh = run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True), CS=make_CS(standstill=True))
-    assert not mock_bh.called
+    self.assertFalse(mock_bh.called)
 
-  @pytest.mark.parametrize("frame,called", [(3, False), (0, True), (5, True)])
-  def test_hold_frame_mod5_gating(self, frame, called):
+  def test_hold_frame_mod5_gating(self):
     # ES_Brake hold recomputes/sends only on frame%5 == 0
-    ctrl = make_ctrl()
-    ctrl.frame = frame
-    ctrl._brake_hold_primed = True
-    mock_bh = run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
-                         CS=make_CS(standstill=True, brakePressed=False))
-    assert mock_bh.called is called
+    for frame, called in [(3, False), (0, True), (5, True)]:
+      with self.subTest(frame=frame):
+        ctrl = make_ctrl()
+        ctrl.frame = frame
+        ctrl._brake_hold_primed = True
+        mock_bh = run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
+                             CS=make_CS(standstill=True, brakePressed=False))
+        self.assertIs(mock_bh.called, called)
 
   def test_mask_sends_without_es_brake_at_frame2(self):
     # Brake_Status mask (frame%2==0) and ES_Brake hold (frame%5==0) run on independent cadences;
@@ -239,8 +244,8 @@ class TestBrakeHoldController:
       ctrl, CC_SP=make_CC_SP(mads_enabled=True),
       CS=make_CS(standstill=True, brakePressed=False, gasPressed=False),
     )
-    assert not mock_bh.called
-    assert mock_bsh.called
+    self.assertFalse(mock_bh.called)
+    self.assertTrue(mock_bsh.called)
 
   def test_real_packer_emits_hold_pressure(self):
     # real create_es_brake_hold + CANPacker — catches controller↔packer DBC drift the mocks can't
@@ -254,22 +259,22 @@ class TestBrakeHoldController:
         make_CS(standstill=True, brakePressed=False, gasPressed=False), 0,
       )
     es_brake = [m for m in can_sends if isinstance(m[0], int) and m[0] == 0x220]
-    assert len(es_brake) == 1, "exactly one real ES_Brake frame expected"
+    self.assertEqual(len(es_brake), 1, "exactly one real ES_Brake frame expected")
     parser = CANParser(_DBC_NAMES[Bus.pt], [("ES_Brake", 0)], 0)
     parser.update([0, es_brake])
-    assert parser.vl["ES_Brake"]["Brake_Pressure"] == CarControllerParams.BRAKE_HOLD_PRESSURE
+    self.assertEqual(parser.vl["ES_Brake"]["Brake_Pressure"], CarControllerParams.BRAKE_HOLD_PRESSURE)
 
 
 # Regression for route dde08cad3a74cd94/0000004d--8360486eb1 seg 3 (2026-05-11): the carcontroller
 # unconditionally injected ES_Brake=0 and the Brake_Status mask while Eyesight ACC was braking from
 # rolling speed, hiding the braking module's feedback and tripping Eyesight's ~566ms Cruise_Fault
 # watchdog. Invariant: when NOT holding AND NOT echoing AEB, transmit neither 0x220 nor 0x13C.
-class TestACCInterferenceRegression:
+class TestACCInterferenceRegression(unittest.TestCase):
 
   def test_brake_hold_active_false_on_init(self):
     ctrl = make_ctrl()
-    assert hasattr(ctrl, "_brake_hold_active")
-    assert ctrl._brake_hold_active is False
+    self.assertTrue(hasattr(ctrl, "_brake_hold_active"))
+    self.assertFalse(ctrl._brake_hold_active)
 
   def test_no_es_brake_hold_when_acc_braking_not_holding(self):
     # Eyesight ACC braking from rolling speed (Brake_Pressure>0), not holding → stay out of the way
@@ -287,8 +292,8 @@ class TestACCInterferenceRegression:
       CS=make_CS(vEgoRaw=2.32, standstill=False, brakePressed=False,
                  gasPressed=False, es_brake_msg=acc_braking_msg),
     )
-    assert not mock_bh.called
-    assert not mock_bsh.called
+    self.assertFalse(mock_bh.called)
+    self.assertFalse(mock_bsh.called)
 
   def test_no_brake_status_mask_when_not_holding(self):
     ctrl = make_ctrl()
@@ -298,8 +303,8 @@ class TestACCInterferenceRegression:
       ctrl, CC_SP=make_CC_SP(mads_enabled=True),
       CS=make_CS(standstill=False, brakePressed=False, gasPressed=False, vEgoRaw=5.0),
     )
-    assert not mock_bh.called
-    assert not mock_bsh.called
+    self.assertFalse(mock_bh.called)
+    self.assertFalse(mock_bsh.called)
 
   def test_holding_path_unchanged_regression(self):
     ctrl = make_ctrl()
@@ -309,10 +314,10 @@ class TestACCInterferenceRegression:
       ctrl, CC_SP=make_CC_SP(mads_enabled=True),
       CS=make_CS(standstill=True, brakePressed=False, gasPressed=False),
     )
-    assert mock_bh.called
-    assert mock_bh.call_args[0][3] is False  # stock Eyesight ACC — forward fault verbatim
-    assert mock_bh.call_args[0][4] == CarControllerParams.BRAKE_HOLD_PRESSURE
-    assert mock_bsh.called
+    self.assertTrue(mock_bh.called)
+    self.assertFalse(mock_bh.call_args[0][3])  # stock Eyesight ACC — forward fault verbatim
+    self.assertEqual(mock_bh.call_args[0][4], CarControllerParams.BRAKE_HOLD_PRESSURE)
+    self.assertTrue(mock_bsh.called)
 
   def test_aeb_passthrough_keeps_both_messages(self):
     # AEB is an active intercept: echo ES_Brake (full AEB authority) AND keep the mask
@@ -329,9 +334,9 @@ class TestACCInterferenceRegression:
       CS=make_CS(standstill=False, vEgoRaw=8.0, brakePressed=False,
                  gasPressed=False, es_brake_msg=aeb_msg),
     )
-    assert mock_bh.called
-    assert mock_bh.call_args[0][4] == 600
-    assert mock_bsh.called
+    self.assertTrue(mock_bh.called)
+    self.assertEqual(mock_bh.call_args[0][4], 600)
+    self.assertTrue(mock_bsh.called)
 
   def test_brake_hold_active_tracks_state(self):
     # _brake_hold_active must be True iff (holding or AEB)
@@ -344,13 +349,13 @@ class TestACCInterferenceRegression:
                "Cruise_Activated": 1, "Signal3": 0}
     run_update_capture_both(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
                             CS=make_CS(standstill=False, vEgoRaw=2.3, es_brake_msg=acc_msg))
-    assert ctrl._brake_hold_active is False
+    self.assertFalse(ctrl._brake_hold_active)
 
     ctrl._brake_hold_primed = True
     ctrl.frame = 0
     run_update_capture_both(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
                             CS=make_CS(standstill=True, brakePressed=False, gasPressed=False))
-    assert ctrl._brake_hold_active is True
+    self.assertTrue(ctrl._brake_hold_active)
 
     ctrl._brake_hold_primed = False
     ctrl.frame = 0
@@ -359,7 +364,7 @@ class TestACCInterferenceRegression:
                "Cruise_Activated": 0, "Signal3": 0}
     run_update_capture_both(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
                             CS=make_CS(standstill=False, vEgoRaw=8.0, es_brake_msg=aeb_msg))
-    assert ctrl._brake_hold_active is True
+    self.assertTrue(ctrl._brake_hold_active)
 
   def test_brake_status_msg_none_guard(self):
     ctrl = make_ctrl()
@@ -368,8 +373,8 @@ class TestACCInterferenceRegression:
     CS = make_CS(standstill=True, brakePressed=False, gasPressed=False)
     CS.brake_status_msg = None
     mock_bh, mock_bsh = run_update_capture_both(ctrl, CC_SP=make_CC_SP(mads_enabled=True), CS=CS)
-    assert mock_bh.called  # ES_Brake hold still goes out
-    assert not mock_bsh.called  # mask gated on brake_status_msg presence
+    self.assertTrue(mock_bh.called)  # ES_Brake hold still goes out
+    self.assertFalse(mock_bsh.called)  # mask gated on brake_status_msg presence
 
 
 # AVH owns ES_Brake when openpilotLongitudinalControl=True AND longActive=False; it must yield
@@ -392,7 +397,7 @@ def _run_long_branch(ctrl, CC, CC_SP=None, CS=None):
   return mock_eb, mock_bh, mock_bsh
 
 
-class TestAlphaLongCoexistence:
+class TestAlphaLongCoexistence(unittest.TestCase):
 
   def test_avh_fires_when_alpha_long_enabled_but_not_active(self):
     ctrl = make_ctrl(long_control=True, brake_hold=True)
@@ -403,10 +408,10 @@ class TestAlphaLongCoexistence:
       ctrl, CC, CC_SP=make_CC_SP(mads_enabled=True),
       CS=make_CS(standstill=True, brakePressed=False, gasPressed=False),
     )
-    assert mock_bh.called, "create_es_brake_hold must run when alpha long enabled but inactive"
-    assert not mock_eb.called, "create_es_brake must NOT run when AVH is asserting ES_Brake"
-    assert mock_bh.call_args[0][3] is True  # alpha long enabled — clear the latched fault
-    assert mock_bh.call_args[0][4] == CarControllerParams.BRAKE_HOLD_PRESSURE
+    self.assertTrue(mock_bh.called, "create_es_brake_hold must run when alpha long enabled but inactive")
+    self.assertFalse(mock_eb.called, "create_es_brake must NOT run when AVH is asserting ES_Brake")
+    self.assertTrue(mock_bh.call_args[0][3])  # alpha long enabled — clear the latched fault
+    self.assertEqual(mock_bh.call_args[0][4], CarControllerParams.BRAKE_HOLD_PRESSURE)
 
   def test_avh_yields_when_alpha_long_active(self):
     ctrl = make_ctrl(long_control=True, brake_hold=True)
@@ -417,8 +422,8 @@ class TestAlphaLongCoexistence:
       ctrl, CC, CC_SP=make_CC_SP(mads_enabled=True),
       CS=make_CS(standstill=True, brakePressed=False, gasPressed=False),
     )
-    assert not mock_bh.called, "create_es_brake_hold must yield to op long when long_active=True"
-    assert mock_eb.called, "create_es_brake must run when long is actively in control"
+    self.assertFalse(mock_bh.called, "create_es_brake_hold must yield to op long when long_active=True")
+    self.assertTrue(mock_eb.called, "create_es_brake must run when long is actively in control")
 
   def test_brake_status_mask_under_alpha_long_when_avh_active(self):
     ctrl = make_ctrl(long_control=True, brake_hold=True)
@@ -429,7 +434,7 @@ class TestAlphaLongCoexistence:
       ctrl, CC, CC_SP=make_CC_SP(mads_enabled=True),
       CS=make_CS(standstill=True, brakePressed=False, gasPressed=False),
     )
-    assert mock_bsh.called, "Brake_Status mask must run when AVH active under alpha long"
+    self.assertTrue(mock_bsh.called, "Brake_Status mask must run when AVH active under alpha long")
 
   def test_brake_status_mask_yields_under_alpha_long_active(self):
     ctrl = make_ctrl(long_control=True, brake_hold=True)
@@ -440,26 +445,26 @@ class TestAlphaLongCoexistence:
       ctrl, CC, CC_SP=make_CC_SP(mads_enabled=True),
       CS=make_CS(standstill=True, brakePressed=False, gasPressed=False),
     )
-    assert not mock_bsh.called, "Brake_Status mask must not run when long is active"
+    self.assertFalse(mock_bsh.called, "Brake_Status mask must not run when long is active")
 
 
 # AVH must never prime or hold while Eyesight ACC is engaged (cruiseState.enabled); the guard
 # gates only on .enabled, not .available, and AEB echo stays independent of ACC.
-class TestACCDeference:
+class TestACCDeference(unittest.TestCase):
 
   def test_no_prime_when_acc_enabled(self):
     ctrl = make_ctrl()
     ctrl.frame = 1
     run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
                CS=make_CS(vEgoRaw=0.5, brakePressed=True, cruise_enabled=True))
-    assert ctrl._brake_hold_primed is False
+    self.assertFalse(ctrl._brake_hold_primed)
 
   def test_no_prime_when_acc_enabled_rolling(self):
     ctrl = make_ctrl()
     ctrl.frame = 1
     run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
                CS=make_CS(vEgoRaw=1.2, brakePressed=True, cruise_enabled=True))
-    assert ctrl._brake_hold_primed is False
+    self.assertFalse(ctrl._brake_hold_primed)
 
   def test_no_hold_when_acc_enabled(self):
     ctrl = make_ctrl()
@@ -467,7 +472,7 @@ class TestACCDeference:
     ctrl._brake_hold_primed = True
     mock_bh = run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
                          CS=make_CS(standstill=True, gasPressed=False, cruise_enabled=True))
-    assert not mock_bh.called
+    self.assertFalse(mock_bh.called)
 
   def test_release_when_acc_enabled(self):
     # primed while ACC off, then ACC engages → latch clears on the frame%5==0 reset
@@ -475,12 +480,12 @@ class TestACCDeference:
     ctrl.frame = 1
     run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
                CS=make_CS(vEgoRaw=0.5, brakePressed=True, cruise_enabled=False))
-    assert ctrl._brake_hold_primed is True, "precondition: must be primed"
+    self.assertTrue(ctrl._brake_hold_primed, "precondition: must be primed")
 
     ctrl.frame = 5
     run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
                CS=make_CS(standstill=True, gasPressed=False, cruise_enabled=True))
-    assert ctrl._brake_hold_primed is False
+    self.assertFalse(ctrl._brake_hold_primed)
 
   def test_no_brake_status_mask_when_acc_enabled(self):
     ctrl = make_ctrl()
@@ -491,7 +496,7 @@ class TestACCDeference:
       ctrl, CC_SP=make_CC_SP(mads_enabled=True),
       CS=make_CS(standstill=True, gasPressed=False, cruise_enabled=True),
     )
-    assert not mock_bsh.called
+    self.assertFalse(mock_bsh.called)
 
   def test_mask_clears_when_acc_engages_midcadence(self):
     # frame=2: mask cadence (frame%2==0) but no state recompute (frame%5!=0); carried-over
@@ -504,7 +509,7 @@ class TestACCDeference:
       ctrl, CC_SP=make_CC_SP(mads_enabled=True),
       CS=make_CS(standstill=True, gasPressed=False, aeb_status=0, cruise_enabled=True),
     )
-    assert not mock_bsh.called
+    self.assertFalse(mock_bsh.called)
 
   def test_acc_available_but_not_enabled_still_holds(self):
     # guard gates only on .enabled — main-on (available) but not engaged must still hold
@@ -514,8 +519,8 @@ class TestACCDeference:
     mock_bh = run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
                          CS=make_CS(standstill=True, gasPressed=False,
                                     cruise_available=True, cruise_enabled=False))
-    assert mock_bh.called
-    assert mock_bh.call_args[0][4] == CarControllerParams.BRAKE_HOLD_PRESSURE
+    self.assertTrue(mock_bh.called)
+    self.assertEqual(mock_bh.call_args[0][4], CarControllerParams.BRAKE_HOLD_PRESSURE)
 
   def test_aeb_echo_unaffected_by_acc(self):
     # AEB authority is independent of ACC engagement
@@ -530,8 +535,8 @@ class TestACCDeference:
     mock_bh = run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
                          CS=make_CS(standstill=False, vEgoRaw=8.0, brakePressed=False,
                                     gasPressed=False, es_brake_msg=aeb_msg, cruise_enabled=True))
-    assert mock_bh.called
-    assert mock_bh.call_args[0][4] == 600
+    self.assertTrue(mock_bh.called)
+    self.assertEqual(mock_bh.call_args[0][4], 600)
 
   def test_no_hold_when_acc_enabled_alpha_long(self):
     ctrl = make_ctrl(long_control=True)
@@ -542,7 +547,7 @@ class TestACCDeference:
       ctrl, CC, CC_SP=make_CC_SP(mads_enabled=True),
       CS=make_CS(standstill=True, brakePressed=False, gasPressed=False, cruise_enabled=True),
     )
-    assert not mock_bh.called
+    self.assertFalse(mock_bh.called)
 
   def test_real_packer_no_es_brake_when_acc_enabled(self):
     ctrl = make_ctrl()
@@ -555,4 +560,8 @@ class TestACCDeference:
         make_CS(standstill=True, brakePressed=False, gasPressed=False, cruise_enabled=True), 0,
       )
     es_brake_frames = [m for m in can_sends if isinstance(m[0], int) and m[0] == 0x220]
-    assert len(es_brake_frames) == 0, "no ES_Brake frame must be emitted when ACC is engaged"
+    self.assertEqual(len(es_brake_frames), 0, "no ES_Brake frame must be emitted when ACC is engaged")
+
+
+if __name__ == "__main__":
+  unittest.main()

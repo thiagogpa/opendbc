@@ -4,6 +4,7 @@ Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
 This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 """
+import unittest
 from unittest.mock import MagicMock
 
 from opendbc.car import structs
@@ -21,29 +22,33 @@ def _run_setup(params: dict, brand: str = 'subaru', alpha_long_available: bool =
   return CP, CP_SP
 
 
-class TestBrakeInterceptInit:
+class TestBrakeInterceptInit(unittest.TestCase):
   def test_flag_not_set_when_param_off(self):
     CP, CP_SP = _run_setup({"SubaruAutoVehicleHold": "0"})
-    assert not (CP.flags & SubaruFlags.BRAKE_HOLD)
-    assert not (CP_SP.safetyParam & SubaruSafetyFlagsSP.BRAKE_INTERCEPT)
+    self.assertFalse(CP.flags & SubaruFlags.BRAKE_HOLD)
+    self.assertFalse(CP_SP.safetyParam & SubaruSafetyFlagsSP.BRAKE_INTERCEPT)
 
   def test_flag_set_when_param_on(self):
     CP, CP_SP = _run_setup({"SubaruAutoVehicleHold": "1"})
-    assert CP.flags & SubaruFlags.BRAKE_HOLD
-    assert CP_SP.safetyParam & SubaruSafetyFlagsSP.BRAKE_INTERCEPT
+    self.assertTrue(CP.flags & SubaruFlags.BRAKE_HOLD)
+    self.assertTrue(CP_SP.safetyParam & SubaruSafetyFlagsSP.BRAKE_INTERCEPT)
 
   def test_flag_not_set_when_ineligible_even_if_param_on(self):
     CP, CP_SP = _run_setup({"SubaruAutoVehicleHold": "1"}, alpha_long_available=False)
-    assert not (CP.flags & SubaruFlags.BRAKE_HOLD)
-    assert not (CP_SP.safetyParam & SubaruSafetyFlagsSP.BRAKE_INTERCEPT)
+    self.assertFalse(CP.flags & SubaruFlags.BRAKE_HOLD)
+    self.assertFalse(CP_SP.safetyParam & SubaruSafetyFlagsSP.BRAKE_INTERCEPT)
 
   def test_brake_intercept_preserves_sng_bit(self):
     # BRAKE_INTERCEPT is OR-added, must not clobber the SnG safety bit
     _, CP_SP = _run_setup({"SubaruStopAndGo": "1", "SubaruAutoVehicleHold": "1"})
-    assert CP_SP.safetyParam & SubaruSafetyFlagsSP.STOP_AND_GO
-    assert CP_SP.safetyParam & SubaruSafetyFlagsSP.BRAKE_INTERCEPT
+    self.assertTrue(CP_SP.safetyParam & SubaruSafetyFlagsSP.STOP_AND_GO)
+    self.assertTrue(CP_SP.safetyParam & SubaruSafetyFlagsSP.BRAKE_INTERCEPT)
 
   def test_non_subaru_brand_untouched(self):
     CP, CP_SP = _run_setup({"SubaruAutoVehicleHold": "1"}, brand='toyota')
-    assert not (CP.flags & SubaruFlags.BRAKE_HOLD)
-    assert not (CP_SP.safetyParam & SubaruSafetyFlagsSP.BRAKE_INTERCEPT)
+    self.assertFalse(CP.flags & SubaruFlags.BRAKE_HOLD)
+    self.assertFalse(CP_SP.safetyParam & SubaruSafetyFlagsSP.BRAKE_INTERCEPT)
+
+
+if __name__ == "__main__":
+  unittest.main()
