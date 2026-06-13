@@ -25,6 +25,7 @@ class CarController(CarControllerBase, SnGCarController):
     self.steer_rate_counter = 0
     self._brake_hold_primed = False
     self._brake_hold_active = False
+    self._brake_hold_standstill_count = 0
 
     self.p = CarControllerParams(CP)
     self.packer = CANPacker(DBC[CP.carFingerprint][Bus.pt])
@@ -43,6 +44,15 @@ class CarController(CarControllerBase, SnGCarController):
       if CS.out.gearShifter not in (GearShifter.park, GearShifter.reverse):
         self._brake_hold_primed = True
 
+    # Confirm sustained standstill — wheel-speed sensors quantize to 0 below ~0.5 km/h
+    # while the vehicle is still rolling; only allow hold once the counter clears the
+    # threshold (driver's own brake holds the car through this window).
+    if CS.out.standstill:
+      self._brake_hold_standstill_count = min(self._brake_hold_standstill_count + 1,
+                                              CarControllerParams.BRAKE_HOLD_STANDSTILL_FRAMES)
+    else:
+      self._brake_hold_standstill_count = 0
+
     if self.frame % 5 != 0:
       if CS.out.cruiseState.enabled and CS.es_brake_msg["AEB_Status"] == 0:
         self._brake_hold_active = False
@@ -50,6 +60,7 @@ class CarController(CarControllerBase, SnGCarController):
 
     holding = (self._brake_hold_primed
                and CS.out.standstill
+               and self._brake_hold_standstill_count >= CarControllerParams.BRAKE_HOLD_STANDSTILL_FRAMES
                and not CS.out.gasPressed
                and not CS.out.cruiseState.enabled
                and CS.out.gearShifter not in (GearShifter.park, GearShifter.reverse))

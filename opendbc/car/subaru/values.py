@@ -52,6 +52,7 @@ class CarControllerParams:
   BRAKE_LOOKUP_V = [BRAKE_MAX, BRAKE_MIN]
 
   BRAKE_HOLD_PRESSURE = 600  # max pressure; ensures hold on slopes
+  BRAKE_HOLD_STANDSTILL_FRAMES = 20  # 200ms @ 100Hz; wheel speeds quantize to 0 below ~0.5 km/h
 
 
 class SubaruSafetyFlags(IntFlag):

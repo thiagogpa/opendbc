@@ -94,6 +94,14 @@ def make_ctrl(brake_hold: bool = True, long_control: bool = False) -> CarControl
   return CarController(_DBC_NAMES, CP, CP_SP)
 
 
+def make_ctrl_confirmed(brake_hold: bool = True, long_control: bool = False) -> CarController:
+  """make_ctrl + counter pre-seeded so a single update can hit the hold branch.
+  Tests for hold/AEB/ACC arbitration (not confirmation timing) use this."""
+  ctrl = make_ctrl(brake_hold=brake_hold, long_control=long_control)
+  ctrl._brake_hold_standstill_count = CarControllerParams.BRAKE_HOLD_STANDSTILL_FRAMES
+  return ctrl
+
+
 # patch the unrelated send fns that choke on the mock CS data
 _STEERING_PATCH = patch("opendbc.car.subaru.subarucan.create_steering_control", return_value=_DUMMY_MSG)
 _DASHSTATUS_PATCH = patch("opendbc.car.subaru.subarucan.create_es_dashstatus", return_value=_DUMMY_MSG)
@@ -165,7 +173,7 @@ class TestBrakeHoldController(unittest.TestCase):
       (True, True, False, False, GearShifter.drive, True),   # all met
     ]:
       with self.subTest(primed=primed, standstill=standstill, brake=brake, gas=gas, gear=gear):
-        ctrl = make_ctrl()
+        ctrl = make_ctrl_confirmed()
         ctrl.frame = 0  # frame%5 == 0: hold branch runs
         ctrl._brake_hold_primed = primed
         mock_bh = run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
@@ -182,7 +190,7 @@ class TestBrakeHoldController(unittest.TestCase):
       (False, False, 8.0, 4, 600, 600),  # AEB while moving, not holding → passthrough
     ]:
       with self.subTest(aeb_status=aeb_status, eyesight_pressure=eyesight_pressure):
-        ctrl = make_ctrl()
+        ctrl = make_ctrl_confirmed()
         ctrl.frame = 0
         ctrl._brake_hold_primed = primed
         es_msg = {"AEB_Status": aeb_status, "CHECKSUM": 0, "Signal1": 0, "Brake_Pressure": eyesight_pressure,
@@ -226,7 +234,7 @@ class TestBrakeHoldController(unittest.TestCase):
     # ES_Brake hold recomputes/sends only on frame%5 == 0
     for frame, called in [(3, False), (0, True), (5, True)]:
       with self.subTest(frame=frame):
-        ctrl = make_ctrl()
+        ctrl = make_ctrl_confirmed()
         ctrl.frame = frame
         ctrl._brake_hold_primed = True
         mock_bh = run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
@@ -249,7 +257,7 @@ class TestBrakeHoldController(unittest.TestCase):
 
   def test_real_packer_emits_hold_pressure(self):
     # real create_es_brake_hold + CANPacker — catches controller↔packer DBC drift the mocks can't
-    ctrl = make_ctrl()
+    ctrl = make_ctrl_confirmed()
     ctrl.frame = 0
     ctrl._brake_hold_primed = True
     with _STEERING_PATCH, _DASHSTATUS_PATCH, _LKAS_STATE_PATCH, \
@@ -307,7 +315,7 @@ class TestACCInterferenceRegression(unittest.TestCase):
     self.assertFalse(mock_bsh.called)
 
   def test_holding_path_unchanged_regression(self):
-    ctrl = make_ctrl()
+    ctrl = make_ctrl_confirmed()
     ctrl.frame = 0
     ctrl._brake_hold_primed = True
     mock_bh, mock_bsh = run_update_capture_both(
@@ -352,6 +360,7 @@ class TestACCInterferenceRegression(unittest.TestCase):
     self.assertFalse(ctrl._brake_hold_active)
 
     ctrl._brake_hold_primed = True
+    ctrl._brake_hold_standstill_count = CarControllerParams.BRAKE_HOLD_STANDSTILL_FRAMES
     ctrl.frame = 0
     run_update_capture_both(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
                             CS=make_CS(standstill=True, brakePressed=False, gasPressed=False))
@@ -367,7 +376,7 @@ class TestACCInterferenceRegression(unittest.TestCase):
     self.assertTrue(ctrl._brake_hold_active)
 
   def test_brake_status_msg_none_guard(self):
-    ctrl = make_ctrl()
+    ctrl = make_ctrl_confirmed()
     ctrl.frame = 0
     ctrl._brake_hold_primed = True
     CS = make_CS(standstill=True, brakePressed=False, gasPressed=False)
@@ -400,7 +409,7 @@ def _run_long_branch(ctrl, CC, CC_SP=None, CS=None):
 class TestAlphaLongCoexistence(unittest.TestCase):
 
   def test_avh_fires_when_alpha_long_enabled_but_not_active(self):
-    ctrl = make_ctrl(long_control=True, brake_hold=True)
+    ctrl = make_ctrl_confirmed(long_control=True, brake_hold=True)
     ctrl.frame = 0
     ctrl._brake_hold_primed = True
     CC = make_CC(enabled=False, long_active=False)
@@ -426,7 +435,7 @@ class TestAlphaLongCoexistence(unittest.TestCase):
     self.assertTrue(mock_eb.called, "create_es_brake must run when long is actively in control")
 
   def test_brake_status_mask_under_alpha_long_when_avh_active(self):
-    ctrl = make_ctrl(long_control=True, brake_hold=True)
+    ctrl = make_ctrl_confirmed(long_control=True, brake_hold=True)
     ctrl.frame = 0
     ctrl._brake_hold_primed = True
     CC = make_CC(enabled=False, long_active=False)
@@ -513,7 +522,7 @@ class TestACCDeference(unittest.TestCase):
 
   def test_acc_available_but_not_enabled_still_holds(self):
     # guard gates only on .enabled — main-on (available) but not engaged must still hold
-    ctrl = make_ctrl()
+    ctrl = make_ctrl_confirmed()
     ctrl.frame = 0
     ctrl._brake_hold_primed = True
     mock_bh = run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
@@ -561,6 +570,73 @@ class TestACCDeference(unittest.TestCase):
       )
     es_brake_frames = [m for m in can_sends if isinstance(m[0], int) and m[0] == 0x220]
     self.assertEqual(len(es_brake_frames), 0, "no ES_Brake frame must be emitted when ACC is engaged")
+
+
+# Regression for route dde08cad3a74cd94/00000082--532537b746 seg 3 (2026-06-12): wheel-speed
+# signals quantize to 0 below ~0.5 km/h while the vehicle is still rolling. The standstill
+# flag flips True ~370ms before the IMU-confirmed zero-crossing; clamping ES_Brake=600 at
+# that moment yields a -0.9 m/s^2 jerk. Invariant: require sustained standstill before hold.
+class TestStandstillConfirmation(unittest.TestCase):
+
+  def test_no_hold_on_first_standstill_frame(self):
+    # Counter starts at 0 on construction; first standstill frame must not engage hold.
+    ctrl = make_ctrl()
+    ctrl.frame = 0
+    ctrl._brake_hold_primed = True
+    mock_bh = run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
+                         CS=make_CS(standstill=True, brakePressed=False, gasPressed=False))
+    self.assertFalse(mock_bh.called, "hold must not engage on the first standstill frame")
+
+  def test_counter_zero_on_init(self):
+    self.assertEqual(make_ctrl()._brake_hold_standstill_count, 0)
+
+  def test_counter_increments_while_standstill(self):
+    ctrl = make_ctrl()
+    ctrl._brake_hold_primed = True
+    for i in range(1, 6):
+      ctrl.frame = i  # avoid frame%5==0 reset paths; just exercise the per-call counter
+      run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
+                 CS=make_CS(standstill=True, brakePressed=False, gasPressed=False))
+      self.assertEqual(ctrl._brake_hold_standstill_count, i)
+
+  def test_counter_resets_when_not_standstill(self):
+    ctrl = make_ctrl()
+    ctrl._brake_hold_primed = True
+    ctrl._brake_hold_standstill_count = 10
+    ctrl.frame = 1
+    run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
+               CS=make_CS(standstill=False, vEgoRaw=0.2, brakePressed=True))
+    self.assertEqual(ctrl._brake_hold_standstill_count, 0)
+
+  def test_counter_clamps_at_threshold(self):
+    ctrl = make_ctrl()
+    ctrl._brake_hold_primed = True
+    ctrl._brake_hold_standstill_count = CarControllerParams.BRAKE_HOLD_STANDSTILL_FRAMES
+    ctrl.frame = 1
+    run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
+               CS=make_CS(standstill=True, brakePressed=False, gasPressed=False))
+    self.assertEqual(ctrl._brake_hold_standstill_count,
+                     CarControllerParams.BRAKE_HOLD_STANDSTILL_FRAMES)
+
+  def test_hold_engages_at_threshold(self):
+    ctrl = make_ctrl()
+    ctrl._brake_hold_primed = True
+    # one more standstill call inside run_update lifts count to threshold → hold engages
+    ctrl._brake_hold_standstill_count = CarControllerParams.BRAKE_HOLD_STANDSTILL_FRAMES - 1
+    ctrl.frame = 0  # inject cadence
+    mock_bh = run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
+                         CS=make_CS(standstill=True, brakePressed=False, gasPressed=False))
+    self.assertTrue(mock_bh.called)
+    self.assertEqual(mock_bh.call_args[0][4], CarControllerParams.BRAKE_HOLD_PRESSURE)
+
+  def test_hold_blocked_below_threshold(self):
+    ctrl = make_ctrl()
+    ctrl._brake_hold_primed = True
+    ctrl._brake_hold_standstill_count = 5  # well below threshold
+    ctrl.frame = 0
+    mock_bh = run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
+                         CS=make_CS(standstill=True, brakePressed=False, gasPressed=False))
+    self.assertFalse(mock_bh.called)
 
 
 if __name__ == "__main__":
