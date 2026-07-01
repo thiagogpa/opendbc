@@ -639,5 +639,38 @@ class TestStandstillConfirmation(unittest.TestCase):
     self.assertFalse(mock_bh.called)
 
 
+class TestBrakeHoldEngagementGate(unittest.TestCase):
+
+  def test_no_hold_when_brake_released_before_engagement(self):
+    ctrl = make_ctrl_confirmed()
+    ctrl.frame = 0
+    ctrl._brake_hold_primed = True
+    mock_bh = run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
+                         CS=make_CS(standstill=True, brakePressed=False, gasPressed=False))
+    self.assertFalse(mock_bh.called,
+                     "hold must not engage when brake released before initial engagement")
+
+  def test_hold_engages_when_brake_held_through_standstill(self):
+    ctrl = make_ctrl_confirmed()
+    ctrl.frame = 0
+    ctrl._brake_hold_primed = True
+    mock_bh = run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
+                         CS=make_CS(standstill=True, brakePressed=True, gasPressed=False))
+    self.assertTrue(mock_bh.called,
+                    "hold must engage when brake still held at confirmed standstill")
+    self.assertEqual(mock_bh.call_args[0][4], CarControllerParams.BRAKE_HOLD_PRESSURE)
+
+  def test_latch_keeps_hold_after_brake_release(self):
+    ctrl = make_ctrl_confirmed()
+    ctrl.frame = 0
+    ctrl._brake_hold_primed = True
+    ctrl._brake_hold_active = True
+    mock_bh = run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
+                         CS=make_CS(standstill=True, brakePressed=False, gasPressed=False))
+    self.assertTrue(mock_bh.called,
+                    "latch must sustain hold after brake release once engaged")
+    self.assertEqual(mock_bh.call_args[0][4], CarControllerParams.BRAKE_HOLD_PRESSURE)
+
+
 if __name__ == "__main__":
   unittest.main()
