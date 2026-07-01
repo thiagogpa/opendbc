@@ -170,7 +170,7 @@ class TestBrakeHoldController(unittest.TestCase):
       (True, True, True, False, GearShifter.drive, True),   # seamless hold, foot still on pedal
       (True, True, False, True,  GearShifter.drive, False),  # gas pressed
       (True, True, False, False, GearShifter.park, False),  # park
-      (True, True, False, False, GearShifter.drive, True),   # all met
+      (True, True, False, False, GearShifter.drive, False),  # all met except brake — gate blocks
     ]:
       with self.subTest(primed=primed, standstill=standstill, brake=brake, gas=gas, gear=gear):
         ctrl = make_ctrl_confirmed()
@@ -197,7 +197,7 @@ class TestBrakeHoldController(unittest.TestCase):
                   "Cruise_Brake_Lights": 0, "Cruise_Brake_Fault": 0, "Cruise_Brake_Active": 0,
                   "Cruise_Activated": 0, "Signal3": 0}
         mock_bh = run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
-                             CS=make_CS(standstill=standstill, vEgoRaw=vego, brakePressed=False,
+                             CS=make_CS(standstill=standstill, vEgoRaw=vego, brakePressed=True,
                                         gasPressed=False, es_brake_msg=es_msg))
         self.assertEqual(self._get_brake_value(mock_bh), expected)
 
@@ -238,7 +238,7 @@ class TestBrakeHoldController(unittest.TestCase):
         ctrl.frame = frame
         ctrl._brake_hold_primed = True
         mock_bh = run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
-                             CS=make_CS(standstill=True, brakePressed=False))
+                             CS=make_CS(standstill=True, brakePressed=True))
         self.assertIs(mock_bh.called, called)
 
   def test_mask_sends_without_es_brake_at_frame2(self):
@@ -264,7 +264,7 @@ class TestBrakeHoldController(unittest.TestCase):
          patch(_BRAKE_STATUS_HOLD_PATCH, return_value=_DUMMY_BS_MSG):
       _, can_sends = ctrl.update(
         make_CC(), make_CC_SP(mads_enabled=True),
-        make_CS(standstill=True, brakePressed=False, gasPressed=False), 0,
+        make_CS(standstill=True, brakePressed=True, gasPressed=False), 0,
       )
     es_brake = [m for m in can_sends if isinstance(m[0], int) and m[0] == 0x220]
     self.assertEqual(len(es_brake), 1, "exactly one real ES_Brake frame expected")
@@ -320,7 +320,7 @@ class TestACCInterferenceRegression(unittest.TestCase):
     ctrl._brake_hold_primed = True
     mock_bh, mock_bsh = run_update_capture_both(
       ctrl, CC_SP=make_CC_SP(mads_enabled=True),
-      CS=make_CS(standstill=True, brakePressed=False, gasPressed=False),
+      CS=make_CS(standstill=True, brakePressed=True, gasPressed=False),
     )
     self.assertTrue(mock_bh.called)
     self.assertFalse(mock_bh.call_args[0][3])  # stock Eyesight ACC — forward fault verbatim
@@ -363,7 +363,7 @@ class TestACCInterferenceRegression(unittest.TestCase):
     ctrl._brake_hold_standstill_count = CarControllerParams.BRAKE_HOLD_STANDSTILL_FRAMES
     ctrl.frame = 0
     run_update_capture_both(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
-                            CS=make_CS(standstill=True, brakePressed=False, gasPressed=False))
+                            CS=make_CS(standstill=True, brakePressed=True, gasPressed=False))
     self.assertTrue(ctrl._brake_hold_active)
 
     ctrl._brake_hold_primed = False
@@ -379,7 +379,7 @@ class TestACCInterferenceRegression(unittest.TestCase):
     ctrl = make_ctrl_confirmed()
     ctrl.frame = 0
     ctrl._brake_hold_primed = True
-    CS = make_CS(standstill=True, brakePressed=False, gasPressed=False)
+    CS = make_CS(standstill=True, brakePressed=True, gasPressed=False)
     CS.brake_status_msg = None
     mock_bh, mock_bsh = run_update_capture_both(ctrl, CC_SP=make_CC_SP(mads_enabled=True), CS=CS)
     self.assertTrue(mock_bh.called)  # ES_Brake hold still goes out
@@ -415,7 +415,7 @@ class TestAlphaLongCoexistence(unittest.TestCase):
     CC = make_CC(enabled=False, long_active=False)
     mock_eb, mock_bh, _ = _run_long_branch(
       ctrl, CC, CC_SP=make_CC_SP(mads_enabled=True),
-      CS=make_CS(standstill=True, brakePressed=False, gasPressed=False),
+      CS=make_CS(standstill=True, brakePressed=True, gasPressed=False),
     )
     self.assertTrue(mock_bh.called, "create_es_brake_hold must run when alpha long enabled but inactive")
     self.assertFalse(mock_eb.called, "create_es_brake must NOT run when AVH is asserting ES_Brake")
@@ -429,7 +429,7 @@ class TestAlphaLongCoexistence(unittest.TestCase):
     CC = make_CC(enabled=True, long_active=True)
     mock_eb, mock_bh, _ = _run_long_branch(
       ctrl, CC, CC_SP=make_CC_SP(mads_enabled=True),
-      CS=make_CS(standstill=True, brakePressed=False, gasPressed=False),
+      CS=make_CS(standstill=True, brakePressed=True, gasPressed=False),
     )
     self.assertFalse(mock_bh.called, "create_es_brake_hold must yield to op long when long_active=True")
     self.assertTrue(mock_eb.called, "create_es_brake must run when long is actively in control")
@@ -441,7 +441,7 @@ class TestAlphaLongCoexistence(unittest.TestCase):
     CC = make_CC(enabled=False, long_active=False)
     _, _, mock_bsh = _run_long_branch(
       ctrl, CC, CC_SP=make_CC_SP(mads_enabled=True),
-      CS=make_CS(standstill=True, brakePressed=False, gasPressed=False),
+      CS=make_CS(standstill=True, brakePressed=True, gasPressed=False),
     )
     self.assertTrue(mock_bsh.called, "Brake_Status mask must run when AVH active under alpha long")
 
@@ -452,7 +452,7 @@ class TestAlphaLongCoexistence(unittest.TestCase):
     CC = make_CC(enabled=True, long_active=True)
     _, _, mock_bsh = _run_long_branch(
       ctrl, CC, CC_SP=make_CC_SP(mads_enabled=True),
-      CS=make_CS(standstill=True, brakePressed=False, gasPressed=False),
+      CS=make_CS(standstill=True, brakePressed=True, gasPressed=False),
     )
     self.assertFalse(mock_bsh.called, "Brake_Status mask must not run when long is active")
 
@@ -526,7 +526,7 @@ class TestACCDeference(unittest.TestCase):
     ctrl.frame = 0
     ctrl._brake_hold_primed = True
     mock_bh = run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
-                         CS=make_CS(standstill=True, gasPressed=False,
+                         CS=make_CS(standstill=True, brakePressed=True, gasPressed=False,
                                     cruise_available=True, cruise_enabled=False))
     self.assertTrue(mock_bh.called)
     self.assertEqual(mock_bh.call_args[0][4], CarControllerParams.BRAKE_HOLD_PRESSURE)
@@ -625,7 +625,7 @@ class TestStandstillConfirmation(unittest.TestCase):
     ctrl._brake_hold_standstill_count = CarControllerParams.BRAKE_HOLD_STANDSTILL_FRAMES - 1
     ctrl.frame = 0  # inject cadence
     mock_bh = run_update(ctrl, CC_SP=make_CC_SP(mads_enabled=True),
-                         CS=make_CS(standstill=True, brakePressed=False, gasPressed=False))
+                         CS=make_CS(standstill=True, brakePressed=True, gasPressed=False))
     self.assertTrue(mock_bh.called)
     self.assertEqual(mock_bh.call_args[0][4], CarControllerParams.BRAKE_HOLD_PRESSURE)
 
