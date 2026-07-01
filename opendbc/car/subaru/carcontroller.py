@@ -61,6 +61,7 @@ class CarController(CarControllerBase, SnGCarController):
     holding = (self._brake_hold_primed
                and CS.out.standstill
                and self._brake_hold_standstill_count >= CarControllerParams.BRAKE_HOLD_STANDSTILL_FRAMES
+               and (CS.out.brakePressed or self._brake_hold_active)
                and not CS.out.gasPressed
                and not CS.out.cruiseState.enabled
                and CS.out.gearShifter not in (GearShifter.park, GearShifter.reverse))
